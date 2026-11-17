@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/cli"]
+exclude = ["spikes/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+authors = ["orphan-audit contributors"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"

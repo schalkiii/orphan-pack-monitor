@@ -1,0 +1,19 @@
+[package]
+name = "orphan-audit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CLI for orphan-audit: detect unused global CLI tools with evidence"
+
+[[bin]]
+name = "orphan-audit"
+path = "src/main.rs"
+
+[dependencies]
+orphan-audit-core = { path = "../core" }
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+dirs = "5"
