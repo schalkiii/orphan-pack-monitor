@@ -131,7 +131,6 @@ fn main() -> Result<()> {
         active_hits: cli.active_hits,
         ignore: cli.ignore.clone(),
         managers: cli.managers.iter().map(|m| Manager::from(*m)).collect(),
-        loose_integration: true,
     };
     let db = cli.db.clone().unwrap_or_else(default_db);
 
@@ -157,7 +156,11 @@ fn main() -> Result<()> {
                     "\nHistory sources: {} | entries: {} | ETW: {}",
                     sources,
                     report.history_total,
-                    if report.tracker.available { "available" } else { "unavailable (degraded)" }
+                    if report.tracker.available {
+                        "available"
+                    } else {
+                        "unavailable (degraded)"
+                    }
                 );
             }
         }
@@ -176,7 +179,14 @@ fn main() -> Result<()> {
                     println!("  {:<12} {}", k, v);
                 }
                 println!("History entries : {}", report.history_total);
-                println!("ETW tracker     : {}", if report.tracker.available { "available" } else { "unavailable (degraded)" });
+                println!(
+                    "ETW tracker     : {}",
+                    if report.tracker.available {
+                        "available"
+                    } else {
+                        "unavailable (degraded)"
+                    }
+                );
                 println!("Degraded mode   : {}", report.degraded);
             }
         }
@@ -186,7 +196,10 @@ fn main() -> Result<()> {
             match output {
                 Some(p) => {
                     std::fs::write(&p, &script)?;
-                    eprintln!("Wrote cleanup script to {} (review before running)", p.display());
+                    eprintln!(
+                        "Wrote cleanup script to {} (review before running)",
+                        p.display()
+                    );
                 }
                 None => print!("{script}"),
             }
@@ -207,8 +220,12 @@ fn main() -> Result<()> {
                 let added: Vec<_> = b.difference(&a).collect();
                 let removed: Vec<_> = a.difference(&b).collect();
                 println!("{}: +{} -{}", v.as_str(), added.len(), removed.len());
-                for x in added { println!("  + {x}"); }
-                for x in removed { println!("  - {x}"); }
+                for x in added {
+                    println!("  + {x}");
+                }
+                for x in removed {
+                    println!("  - {x}");
+                }
             }
         }
     }

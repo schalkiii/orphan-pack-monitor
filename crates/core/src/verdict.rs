@@ -77,8 +77,10 @@ pub fn evaluate(
     // 组织证据链（按强度排序，UI 直接展示）
     if history_hits > 0 {
         evidence.push(
+            // last_seen 恒为 None：纯文本历史无逐条时间戳（mtime 是整批近似值），
+            // 展示具体日期会误导，故 history 证据只报次数不报时间。
             Evidence::new(SignalSource::History, format!("typed {history_hits}x"))
-                .with_last(last_exec.filter(|_| false))
+                .with_last(None)
                 .with_hits(history_hits),
         );
     }
@@ -95,8 +97,7 @@ pub fn evaluate(
     }
     if atime_hit {
         evidence.push(
-            Evidence::new(SignalSource::Atime, "binary access time touched")
-                .with_last(last_exec),
+            Evidence::new(SignalSource::Atime, "binary access time touched").with_last(last_exec),
         );
     }
     if !shell_config_mentions.is_empty() {
@@ -106,7 +107,9 @@ pub fn evaluate(
         ));
     }
 
-    let threshold = config.active_hits.unwrap_or_else(|| adaptive_active_hits(history_total));
+    let threshold = config
+        .active_hits
+        .unwrap_or_else(|| adaptive_active_hits(history_total));
     let in_window = |t: DateTime<Utc>| {
         let age = now.signed_duration_since(t).num_days();
         age >= 0 && age <= config.since_days as i64
@@ -138,7 +141,8 @@ pub fn evaluate(
         Verdict::Unused
     };
 
-    let last_exec_days_ago = last_exec.map(|t| now.signed_duration_since(t).num_days().max(0) as u32);
+    let last_exec_days_ago =
+        last_exec.map(|t| now.signed_duration_since(t).num_days().max(0) as u32);
 
     VerdictResult {
         package: package.clone(),
@@ -192,14 +196,7 @@ pub fn evaluate_all(
             }
             mentions.sort();
 
-            evaluate(
-                p,
-                &matched_events,
-                &mentions,
-                config,
-                history_total,
-                now,
-            )
+            evaluate(p, &matched_events, &mentions, config, history_total, now)
         })
         .collect()
 }
@@ -296,10 +293,7 @@ mod tests {
         );
         // 近期执行过 -> indirect，即使不是用户敲的
         assert_eq!(r.verdict, Verdict::Indirect);
-        assert!(r
-            .evidence
-            .iter()
-            .any(|e| e.detail.contains("via make.exe")));
+        assert!(r.evidence.iter().any(|e| e.detail.contains("via make.exe")));
     }
 
     #[test]
@@ -369,14 +363,7 @@ mod tests {
             since_days: 90,
             ..Default::default()
         };
-        let r90 = evaluate(
-            &pkg("dusty-tool", "dusty"),
-            &[ev],
-            &[],
-            &cfg,
-            1000,
-            now,
-        );
+        let r90 = evaluate(&pkg("dusty-tool", "dusty"), &[ev], &[], &cfg, 1000, now);
         assert_eq!(r90.verdict, Verdict::Indirect);
     }
 
@@ -392,14 +379,7 @@ mod tests {
             ..Default::default()
         };
         let map = std::collections::HashMap::new();
-        let results = evaluate_all(
-            &[dep, ignored, normal],
-            &[],
-            &map,
-            &cfg,
-            1000,
-            fixed_now(),
-        );
+        let results = evaluate_all(&[dep, ignored, normal], &[], &map, &cfg, 1000, fixed_now());
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].package.name, "normal");
     }

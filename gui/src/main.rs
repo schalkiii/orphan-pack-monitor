@@ -5,8 +5,8 @@
 mod view;
 
 use gpui::{
-    div, prelude::*, px, rgb, App, Bounds, ClickEvent, Context, Entity, FontWeight,
-    IntoElement, SharedString, Styled, Window, WindowBounds, WindowOptions,
+    div, prelude::*, px, rgb, App, Bounds, ClickEvent, Context, Entity, FontWeight, IntoElement,
+    SharedString, Styled, Window, WindowBounds, WindowOptions,
 };
 use orphan_audit_core::model::{AuditConfig, Verdict, VerdictResult};
 use view::{build_rows, Row, SortKey, Summary};
@@ -41,7 +41,11 @@ impl AppState {
                     report.results.len(),
                     report.history_total,
                     sources,
-                    if report.tracker.available { "on" } else { "off (degraded)" }
+                    if report.tracker.available {
+                        "on"
+                    } else {
+                        "off (degraded)"
+                    }
                 );
                 Self {
                     results: report.results,
@@ -51,7 +55,8 @@ impl AppState {
                     only_removable: false,
                     sort_key: SortKey::Verdict,
                     status_line: status.into(),
-                    cleanup_preview: "Click 'Preview cleanup' to generate a reviewable script.".into(),
+                    cleanup_preview: "Click 'Preview cleanup' to generate a reviewable script."
+                        .into(),
                 }
             }
             Err(e) => Self {
@@ -159,26 +164,53 @@ impl Render for AppState {
                             .py_1()
                             .rounded_md()
                             .border_1()
-                            .border_color(if only_removable { rgb(0x7aa2f7) } else { rgb(0x2b313d) })
-                            .bg(if only_removable { rgb(0x243049) } else { rgb(0x1d212b) })
+                            .border_color(if only_removable {
+                                rgb(0x7aa2f7)
+                            } else {
+                                rgb(0x2b313d)
+                            })
+                            .bg(if only_removable {
+                                rgb(0x243049)
+                            } else {
+                                rgb(0x1d212b)
+                            })
                             .text_sm()
-                            .text_color(if only_removable { rgb(0x7aa2f7) } else { rgb(0xa9b1c0) })
+                            .text_color(if only_removable {
+                                rgb(0x7aa2f7)
+                            } else {
+                                rgb(0xa9b1c0)
+                            })
                             .child("Only removable")
                             .on_click({
                                 let this = this.clone();
                                 move |_e: &ClickEvent, _window: &mut Window, app: &mut App| {
-                                this.update(app, |state: &mut AppState, cx| {
-                                    state.only_removable = !state.only_removable;
-                                    state.rebuild();
-                                    cx.notify();
-                                });
+                                    this.update(app, |state: &mut AppState, cx| {
+                                        state.only_removable = !state.only_removable;
+                                        state.rebuild();
+                                        cx.notify();
+                                    });
                                 }
                             }),
                     )
-                    .child(sort_button("Verdict", SortKey::Verdict, sort_key, this.clone()))
+                    .child(sort_button(
+                        "Verdict",
+                        SortKey::Verdict,
+                        sort_key,
+                        this.clone(),
+                    ))
                     .child(sort_button("Name", SortKey::Name, sort_key, this.clone()))
-                    .child(sort_button("Manager", SortKey::Manager, sort_key, this.clone()))
-                    .child(sort_button("Last run", SortKey::LastRun, sort_key, this.clone()))
+                    .child(sort_button(
+                        "Manager",
+                        SortKey::Manager,
+                        sort_key,
+                        this.clone(),
+                    ))
+                    .child(sort_button(
+                        "Last run",
+                        SortKey::LastRun,
+                        sort_key,
+                        this.clone(),
+                    ))
                     .child(div().flex_1().child(""))
                     .child(
                         div()
@@ -256,12 +288,7 @@ impl Render for AppState {
                             .text_color(rgb(0x76808f))
                             .child("Cleanup script preview (review before running)"),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0xa9b1c0))
-                            .child(preview),
-                    ),
+                    .child(div().text_xs().text_color(rgb(0xa9b1c0)).child(preview)),
             )
     }
 }
@@ -324,20 +351,51 @@ fn package_row(row: &Row, selected_idx: Option<usize>, this: Entity<AppState>) -
         .py_2()
         .border_b_1()
         .border_color(rgb(0x22262f))
-        .bg(if is_selected { rgb(0x243049) } else { rgb(0x12151c) })
-        .hover(|s| s.bg(rgb(0x1d212b)))
-        .on_click(move |_e: &ClickEvent, _window: &mut Window, app: &mut App| {
-            this.update(app, move |state: &mut AppState, cx| {
-                state.selected = Some(idx);
-                cx.notify();
-            });
+        .bg(if is_selected {
+            rgb(0x243049)
+        } else {
+            rgb(0x12151c)
         })
+        .hover(|s| s.bg(rgb(0x1d212b)))
+        .on_click(
+            move |_e: &ClickEvent, _window: &mut Window, app: &mut App| {
+                this.update(app, move |state: &mut AppState, cx| {
+                    state.selected = Some(idx);
+                    cx.notify();
+                });
+            },
+        )
         .child(div().w(px(240.0)).child(row.name.clone()))
-        .child(div().w(px(80.0)).text_color(rgb(0xa9b1c0)).child(row.manager.clone()))
-        .child(div().w(px(120.0)).text_color(verdict_color).child(row.verdict.as_str()))
-        .child(div().w(px(80.0)).text_color(rgb(0xa9b1c0)).child(row.typed.clone()))
-        .child(div().w(px(100.0)).text_color(rgb(0xa9b1c0)).child(row.last_run.clone()))
-        .child(div().w(px(90.0)).text_color(rgb(0xa9b1c0)).child(row.size.clone()))
+        .child(
+            div()
+                .w(px(80.0))
+                .text_color(rgb(0xa9b1c0))
+                .child(row.manager.clone()),
+        )
+        .child(
+            div()
+                .w(px(120.0))
+                .text_color(verdict_color)
+                .child(row.verdict.as_str()),
+        )
+        .child(
+            div()
+                .w(px(80.0))
+                .text_color(rgb(0xa9b1c0))
+                .child(row.typed.clone()),
+        )
+        .child(
+            div()
+                .w(px(100.0))
+                .text_color(rgb(0xa9b1c0))
+                .child(row.last_run.clone()),
+        )
+        .child(
+            div()
+                .w(px(90.0))
+                .text_color(rgb(0xa9b1c0))
+                .child(row.size.clone()),
+        )
 }
 
 fn evidence_panel(row: Option<&Row>) -> impl IntoElement {
@@ -351,15 +409,12 @@ fn evidence_panel(row: Option<&Row>) -> impl IntoElement {
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(r.name.clone()),
                 )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0x76808f))
-                        .child(format!(
-                            "{} · {} · confidence {}",
-                            r.manager, r.verdict.as_str(), r.confidence
-                        )),
-                );
+                .child(div().text_xs().text_color(rgb(0x76808f)).child(format!(
+                    "{} · {} · confidence {}",
+                    r.manager,
+                    r.verdict.as_str(),
+                    r.confidence
+                )));
             for e in &r.evidence {
                 col = col.child(
                     div()
@@ -402,13 +457,15 @@ fn sort_button(
         .text_sm()
         .text_color(if active { rgb(0x7aa2f7) } else { rgb(0xa9b1c0) })
         .child(label)
-        .on_click(move |_e: &ClickEvent, _window: &mut Window, app: &mut App| {
-            this.update(app, move |state: &mut AppState, cx| {
-                state.sort_key = key;
-                state.rebuild();
-                cx.notify();
-            });
-        })
+        .on_click(
+            move |_e: &ClickEvent, _window: &mut Window, app: &mut App| {
+                this.update(app, move |state: &mut AppState, cx| {
+                    state.sort_key = key;
+                    state.rebuild();
+                    cx.notify();
+                });
+            },
+        )
 }
 
 fn main() {

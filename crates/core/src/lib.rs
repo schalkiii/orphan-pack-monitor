@@ -19,7 +19,7 @@ pub mod store;
 pub mod verdict;
 
 use anyhow::Result;
-use chrono::{Utc};
+use chrono::Utc;
 use model::{AuditConfig, UsageEvent, VerdictResult};
 use std::path::{Path, PathBuf};
 
@@ -57,12 +57,13 @@ pub fn audit_with_paths(config: &AuditConfig, db_path: &Path) -> Result<AuditRep
     warnings.extend(collect_warnings);
 
     // 2. 采集信号
-    let history = signals::collect_history();
+    let mut history = signals::collect_history();
     let shell_config_index = signals::collect_shell_config();
 
     // 2b. ETW 事件（若可用）
     let tracker = etw::probe_status();
-    let mut all_events: Vec<UsageEvent> = history.events.clone();
+    // 事件所有权移入 all_events，避免整表克隆；history.total_entries 仍可用于阈值。
+    let mut all_events: Vec<UsageEvent> = std::mem::take(&mut history.events);
     let degraded = !tracker.available;
     if let Some(log) = etw::default_log_path() {
         match etw::read_etw_log(&log) {
@@ -97,9 +98,8 @@ pub fn audit_with_paths(config: &AuditConfig, db_path: &Path) -> Result<AuditRep
                 }
             }
         } else {
-            warnings.push(
-                "[atime] NTFS last-access updates are disabled; atime signal skipped".into(),
-            );
+            warnings
+                .push("[atime] NTFS last-access updates are disabled; atime signal skipped".into());
         }
     } else {
         warnings.push("[atime] could not determine last-access state; atime signal skipped".into());
@@ -118,7 +118,8 @@ pub fn audit_with_paths(config: &AuditConfig, db_path: &Path) -> Result<AuditRep
     // 4. 持久化（失败不致命，仅警告）
     match store::Store::open(db_path) {
         Ok(st) => {
-            let rows: Vec<store::UsageEventRow> = all_events.iter().map(store::UsageEventRow::from).collect();
+            let rows: Vec<store::UsageEventRow> =
+                all_events.iter().map(store::UsageEventRow::from).collect();
             if let Err(e) = st.replace_inventory(&packages, &rows) {
                 warnings.push(format!("[store] inventory save failed: {e:#}"));
             }
@@ -133,7 +134,7 @@ pub fn audit_with_paths(config: &AuditConfig, db_path: &Path) -> Result<AuditRep
 
     if degraded {
         warnings.push(
-            "[signal] ETW unavailable — verdicts rely on shell history + atime only; run elevated for precise execution tracking".into(),
+            "[signal] no ETW events available — verdicts rely on shell history + atime only (ETW capture component is not bundled; see README)".into(),
         );
     }
 

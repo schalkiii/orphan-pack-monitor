@@ -61,15 +61,15 @@ pub fn cargo_home() -> PathBuf {
 }
 
 /// 解析 cargo 的 .crates2.json，得到 包名 -> [二进制名] 的精确映射。
-/// 结构：{ "installs": { "crate-name version (source)": { "version", "binaries": [...], ... } } }
+/// 结构：{ "installs": { "crate-name version (source)": { "version_req", "bins": [...], ... } } }
 pub fn collect_cargo() -> Result<Vec<Package>> {
     let home = cargo_home();
     let meta = home.join(".crates2.json");
     if !meta.exists() {
         return Ok(Vec::new());
     }
-    let raw = std::fs::read_to_string(&meta)
-        .with_context(|| format!("reading {}", meta.display()))?;
+    let raw =
+        std::fs::read_to_string(&meta).with_context(|| format!("reading {}", meta.display()))?;
     let json: serde_json::Value =
         serde_json::from_str(&raw).with_context(|| "parsing .crates2.json")?;
     let mut packages = Vec::new();
@@ -124,10 +124,7 @@ fn npm_prefix() -> Result<PathBuf> {
     let out = run_command(cmd)?;
     let root = PathBuf::from(out.trim());
     // npm root -g 返回 <prefix>/node_modules
-    Ok(root
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or(root))
+    Ok(root.parent().map(Path::to_path_buf).unwrap_or(root))
 }
 
 /// 解析 npm package.json 的 bin 字段（string 或 object 两种形态）。
@@ -158,8 +155,7 @@ pub fn collect_npm() -> Result<Vec<Package>> {
     let mut cmd = Command::new("npm");
     cmd.args(["ls", "-g", "--json", "--depth=0"]);
     let out = run_command(cmd)?;
-    let list: NpmList =
-        serde_json::from_str(&out).with_context(|| "parsing npm ls -g --json")?;
+    let list: NpmList = serde_json::from_str(&out).with_context(|| "parsing npm ls -g --json")?;
     let prefix = npm_prefix().unwrap_or_default();
     let modules_root = prefix.join("node_modules");
 
@@ -199,7 +195,11 @@ pub fn collect_pip() -> Result<Vec<Package>> {
     if !tool_available("python") && !tool_available("python3") {
         return Ok(Vec::new());
     }
-    let py = if tool_available("python") { "python" } else { "python3" };
+    let py = if tool_available("python") {
+        "python"
+    } else {
+        "python3"
+    };
     let script = r#"
 import json, sys
 try:
@@ -222,19 +222,27 @@ print(json.dumps(out))
     let mut cmd = Command::new(py);
     cmd.args(["-c", script]);
     let out = run_command(cmd)?;
-    let rows: Vec<serde_json::Value> = serde_json::from_str(out.trim())
-        .with_context(|| "parsing python entry points json")?;
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(out.trim()).with_context(|| "parsing python entry points json")?;
     let mut packages = Vec::new();
     for r in rows {
         let Some(name) = r.get("name").and_then(|v| v.as_str()) else {
             continue;
         };
         let mut p = Package::new(name, Manager::Pip);
-        p.version = r.get("version").and_then(|v| v.as_str()).map(str::to_string);
+        p.version = r
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         p.binaries = r
             .get("binaries")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str()).map(str::to_string).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str())
+                    .map(str::to_string)
+                    .collect()
+            })
             .unwrap_or_default();
         p.install_path = r
             .get("location")
@@ -272,7 +280,9 @@ pub fn collect_uv() -> Result<Vec<Package>> {
             // 格式: "name vX.Y.Z" 或 "name vX.Y.Z (path)"
             let mut parts = trimmed.split_whitespace();
             let name = parts.next().unwrap_or("").to_string();
-            let version = parts.find(|s| s.starts_with('v')).map(|s| s[1..].to_string());
+            let version = parts
+                .find(|s| s.starts_with('v'))
+                .map(|s| s[1..].to_string());
             let mut p = Package::new(name, Manager::Uv);
             p.version = version;
             p.confidence = Confidence::Exact;
@@ -308,7 +318,12 @@ pub fn collect_pipx() -> Result<Vec<Package>> {
             p.binaries = val
                 .get("apps")
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str()).map(str::to_string).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str())
+                        .map(str::to_string)
+                        .collect()
+                })
                 .unwrap_or_default();
             p.confidence = Confidence::Exact;
             packages.push(p);

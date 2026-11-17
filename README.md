@@ -8,8 +8,8 @@ Windows 上的孤儿 CLI 工具审计器：找出你装了却长期不用的全�
 | 维度 | shelfware / dusty / dronagiri | UniGetUI / DevTool Manager | **orphan-audit** |
 |---|---|---|---|
 | 平台 | macOS / Linux | Windows（但无使用追踪） | **Windows 原生** |
-| 核心信号 | shell 历史 + atime | 无 | **ETW 进程事件 + 历史 + atime + 配置 + alias** |
-| 归因能力 | 只知道"跑过" | — | **知道谁跑的（父进程）、跑几次** |
+| 核心信号 | shell 历史 + atime | 无 | **ETW 事件日志消费 + 历史 + atime + 配置 + alias** |
+| 归因能力 | 只知道"跑过" | — | **事件日志就绪时知道谁跑的（父进程）、跑几次** |
 | 删除方式 | 生成脚本 / 交互 | 直接卸载 | **只生成脚本，绝不自动删** |
 
 ## 架构
@@ -22,7 +22,7 @@ crates/core/    核心引擎（无 GUI 依赖）
   verdict.rs     五档判定引擎（active/indirect/rare/integration/unused）
   store.rs       SQLite 持久化 + 月度快照（漂移对比）
   actions.rs     卸载脚本与报告生成
-  etw.rs         Windows ETW 执行事件（JSONL 落盘，可降级）
+  etw.rs         ETW 事件日志消费（JSONL 读取；采集端为规划组件）
 crates/cli/     CLI
 gui/            GPUI 桌面界面（独立 workspace，避免拖累 CLI 编译）
 spikes/         技术验证（GPUI Windows 编译 spike）
@@ -58,8 +58,11 @@ cd gui && cargo run
 
 ## ETW 与降级
 
-- 有管理员权限时：可启用 Kernel-Process provider 追踪，记录命令行、父进程、时间戳。
-- 无权限时：自动降级为 shell 历史 + atime，报告明确标注 `degraded`，不会静默给出弱证据结论。
+- 当前版本**只消费** ETW 事件日志（数据目录 `orphan-audit/etw/events.jsonl`，字段：`binary` / `ts` / `parent` / `cmd`），
+  **不自带采集端**；Kernel-Process 采集器属规划组件（见 `AUDIT-REPORT-2026-11-18.md` 的 S17），未随本仓库提供。
+- 报告中的 `ETW: available/unavailable` 反映运行环境（是否提权）与日志可读性；提权本身不会开启任何追踪，
+  在没有外部采集器写入 `events.jsonl` 之前，ETW 信号集为空，判定只依赖 shell 历史 + atime。
+- 无事件日志时报告明确标注 `degraded`，不会静默给出弱证据结论。
 - NTFS atime 自 Win10 1803 默认为 System Managed（启用，60 分钟粒度）；若被禁用会跳过该信号并警告。
 
 ## 实测数据（2026-11-18，本机）

@@ -3293,26 +3293,19 @@ dependencies = [
  "anyhow",
  "chrono",
  "dirs",
- "regex",
  "rusqlite",
  "serde",
  "serde_json",
  "shell-words",
- "tracing",
- "unicode-width",
- "walkdir",
 ]
 
 [[package]]
 name = "orphan-audit-gui"
 version = "0.1.0"
 dependencies = [
- "chrono",
- "dirs",
  "gpui-pre",
  "gpui-pre-platform",
  "orphan-audit-core",
- "serde_json",
 ]
 
 [[package]]

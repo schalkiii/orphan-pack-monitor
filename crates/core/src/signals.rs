@@ -12,8 +12,8 @@
 //! - 路径取 basename，去 .exe 后缀
 //! - Atuin 存在时优先于纯文本历史文件，避免双计
 
-use crate::model::{basename, SignalSource, UsageEvent};
 use crate::inventory::strip_exe;
+use crate::model::{basename, SignalSource, UsageEvent};
 use anyhow::Result;
 use chrono::{DateTime, TimeZone, Utc};
 use std::collections::HashMap;
@@ -35,7 +35,9 @@ pub fn collect_history() -> HistoryResult {
     if let Some(atuin) = atuin_db_path() {
         match parse_atuin(&atuin) {
             Ok(r) if !r.events.is_empty() => {
-                result.sources_used.push(format!("atuin:{}", atuin.display()));
+                result
+                    .sources_used
+                    .push(format!("atuin:{}", atuin.display()));
                 merge(&mut result, r);
                 return result;
             }
@@ -57,14 +59,21 @@ pub fn collect_history() -> HistoryResult {
     }
 
     // bash / zsh 历史（Git Bash / MSYS2 / WSL 挂载）
-    for p in [dirs::home_dir().map(|h| h.join(".bash_history")),
-              dirs::home_dir().map(|h| h.join(".zsh_history"))]
-        .into_iter()
-        .flatten()
+    for p in [
+        dirs::home_dir().map(|h| h.join(".bash_history")),
+        dirs::home_dir().map(|h| h.join(".zsh_history")),
+    ]
+    .into_iter()
+    .flatten()
     {
         if p.exists() {
             if let Ok(r) = parse_plain_history(&p, SignalSource::History) {
-                result.sources_used.push(format!("plain:{}", p.file_name().unwrap().to_string_lossy()));
+                result.sources_used.push(format!(
+                    "plain:{}",
+                    p.file_name()
+                        .map(|f| f.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                ));
                 merge(&mut result, r);
             }
         }
@@ -80,12 +89,20 @@ fn merge(dst: &mut HistoryResult, src: HistoryResult) {
 
 fn atuin_db_path() -> Option<PathBuf> {
     let p = dirs::data_dir()?.join("atuin").join("history.db");
-    if p.exists() { Some(p) } else { None }
+    if p.exists() {
+        Some(p)
+    } else {
+        None
+    }
 }
 
 fn psreadline_dir() -> Option<PathBuf> {
     let base = dirs::home_dir()?.join("AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine");
-    if base.exists() { Some(base) } else { None }
+    if base.exists() {
+        Some(base)
+    } else {
+        None
+    }
 }
 
 /// 解析纯文本历史。PowerShell 的 PSReadLine 默认每行一条命令、无时间戳，
@@ -125,9 +142,8 @@ pub fn parse_plain_history(path: &Path, source: SignalSource) -> Result<HistoryR
 fn parse_atuin(path: &Path) -> Result<HistoryResult> {
     use rusqlite::OpenFlags;
     let conn = rusqlite::Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let mut stmt = conn.prepare(
-        "SELECT command, timestamp FROM history ORDER BY timestamp DESC LIMIT 100000",
-    )?;
+    let mut stmt = conn
+        .prepare("SELECT command, timestamp FROM history ORDER BY timestamp DESC LIMIT 100000")?;
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     })?;
@@ -137,8 +153,15 @@ fn parse_atuin(path: &Path) -> Result<HistoryResult> {
         let (cmd, ts) = row;
         total += 1;
         // Atuin timestamp 是 Unix 秒（部分版本用纳秒）
-        let ts_secs = if ts > 100_000_000_000 { ts / 1_000_000_000 } else { ts };
-        let when = Utc.timestamp_opt(ts_secs, 0).single().unwrap_or_else(Utc::now);
+        let ts_secs = if ts > 100_000_000_000 {
+            ts / 1_000_000_000
+        } else {
+            ts
+        };
+        let when = Utc
+            .timestamp_opt(ts_secs, 0)
+            .single()
+            .unwrap_or_else(Utc::now);
         for part in split_commands(&cmd) {
             if let Some(bin) = real_command_name(&part) {
                 let mut ev = UsageEvent::new(bin, when, SignalSource::History);
@@ -206,7 +229,10 @@ pub fn real_command_name(segment: &str) -> Option<String> {
     let normalized = segment.replace('\\', "/");
     let mut words = shell_words::split(&normalized).ok()?;
     // 去掉 FOO=bar 前置赋值
-    while words.first().is_some_and(|w| w.contains('=') && !w.starts_with('/')) {
+    while words
+        .first()
+        .is_some_and(|w| w.contains('=') && !w.starts_with('/'))
+    {
         words.remove(0);
     }
     // 剥离 wrapper（可能连续多个，如 sudo env FOO=bar cmd）
@@ -223,7 +249,11 @@ pub fn real_command_name(segment: &str) -> Option<String> {
     }
     let first = words.first()?;
     let name = strip_exe(basename(first));
-    if name.is_empty() { None } else { Some(name.to_string()) }
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
 }
 
 /// 扫描 shell 启动配置，构建 命令名 -> [引用位置] 索引。
@@ -233,7 +263,11 @@ pub fn collect_shell_config() -> HashMap<String, Vec<String>> {
     let mut files: Vec<PathBuf> = Vec::new();
     if let Some(home) = dirs::home_dir() {
         for f in [
-            ".bashrc", ".bash_profile", ".zshrc", ".zshenv", ".profile",
+            ".bashrc",
+            ".bash_profile",
+            ".zshrc",
+            ".zshenv",
+            ".profile",
             ".config/fish/config.fish",
         ] {
             files.push(home.join(f));
@@ -249,8 +283,14 @@ pub fn collect_shell_config() -> HashMap<String, Vec<String>> {
         if !path.exists() {
             continue;
         }
-        let Ok(raw) = std::fs::read_to_string(&path) else { continue };
-        let label = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let label = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         for (i, line) in raw.lines().enumerate() {
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -262,7 +302,10 @@ pub fn collect_shell_config() -> HashMap<String, Vec<String>> {
                     let alias_name = rest[..eq].trim();
                     let target = rest[eq + 1..].trim().trim_matches(['\'', '"']);
                     if let Some(bin) = real_command_name(target) {
-                        index.entry(bin).or_default().push(format!("{label}:{} (alias {alias_name})", i + 1));
+                        index
+                            .entry(bin)
+                            .or_default()
+                            .push(format!("{label}:{} (alias {alias_name})", i + 1));
                     }
                     continue;
                 }
@@ -272,7 +315,10 @@ pub fn collect_shell_config() -> HashMap<String, Vec<String>> {
                 let words: Vec<&str> = rest.split_whitespace().collect();
                 if words.len() >= 2 {
                     let target = strip_exe(basename(words[1])).to_string();
-                    index.entry(target).or_default().push(format!("{label}:{} (alias)", i + 1));
+                    index
+                        .entry(target)
+                        .or_default()
+                        .push(format!("{label}:{} (alias)", i + 1));
                 }
                 continue;
             }
@@ -280,8 +326,15 @@ pub fn collect_shell_config() -> HashMap<String, Vec<String>> {
             for tok in trimmed.split_whitespace() {
                 let clean = tok.trim_matches(['\'', '"', '(', ')', ';', '|']);
                 let bin = strip_exe(basename(clean));
-                if bin.len() >= 2 && bin.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-                    index.entry(bin.to_ascii_lowercase()).or_default().push(format!("{label}:{}", i + 1));
+                if bin.len() >= 2
+                    && bin
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                {
+                    index
+                        .entry(bin.to_ascii_lowercase())
+                        .or_default()
+                        .push(format!("{label}:{}", i + 1));
                 }
             }
         }
@@ -303,11 +356,7 @@ pub fn probe_atime(binaries: &[PathBuf]) -> Option<UsageEvent> {
             }
         }
     }
-    latest.map(|t| {
-        let mut ev = UsageEvent::new("atime", t, SignalSource::Atime);
-        ev.count = 1;
-        ev
-    })
+    latest.map(|t| UsageEvent::new("atime", t, SignalSource::Atime))
 }
 
 /// 查询 NTFS LastAccessTime 是否启用。
@@ -323,7 +372,9 @@ pub fn atime_enabled() -> Option<bool> {
         cmd.creation_flags(0x0800_0000);
     }
     let out = cmd.output().ok()?;
-    if !out.status.success() { return None; }
+    if !out.status.success() {
+        return None;
+    }
     let s = String::from_utf8_lossy(&out.stdout);
     // 输出形如 "DisableLastAccess = 2" 或 "= 0x00000002"
     let val = s.split('=').nth(1)?.trim();
@@ -357,9 +408,18 @@ mod tests {
             real_command_name("sudo env FOO=bar rg pattern").as_deref(),
             Some("rg")
         );
-        assert_eq!(real_command_name("/opt/homebrew/bin/bat file").as_deref(), Some("bat"));
-        assert_eq!(real_command_name("FOO=1 make build").as_deref(), Some("make"));
-        assert_eq!(real_command_name("C:\\tools\\fd.exe .").as_deref(), Some("fd"));
+        assert_eq!(
+            real_command_name("/opt/homebrew/bin/bat file").as_deref(),
+            Some("bat")
+        );
+        assert_eq!(
+            real_command_name("FOO=1 make build").as_deref(),
+            Some("make")
+        );
+        assert_eq!(
+            real_command_name("C:\\tools\\fd.exe .").as_deref(),
+            Some("fd")
+        );
     }
 
     #[test]

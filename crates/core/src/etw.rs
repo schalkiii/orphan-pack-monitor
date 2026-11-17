@@ -8,11 +8,12 @@
 //! 权限：Microsoft-Windows-Kernel-Process provider 通常需要管理员权限。
 //! 无权限时追踪器返回不可用状态，上层自动降级到 atime + 历史并在报告中明示。
 //!
-//! 实现策略：优先使用 etw-rs 高层绑定；编译期特性 etw 可关闭以规避平台问题。
+//! 实现现状：本模块是事件日志的**消费端**（读取外部采集器写入的 JSONL），
+//! 不自带 ETW session / 守护进程；Kernel-Process 采集器属规划组件（见 AUDIT-REPORT 的 S17）。
 
 use crate::model::{SignalSource, UsageEvent};
 use chrono::{DateTime, Utc};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// 追踪器状态，供 UI 展示（是否降级、已采集多少事件）。
 #[derive(Debug, Clone, PartialEq)]
@@ -37,7 +38,7 @@ impl Default for TrackerStatus {
 /// 从落盘的事件日志文件读取 ETW 采集到的 UsageEvent。
 /// 守护进程把每条进程创建写成一行 JSONL，避免跨进程共享内存复杂度。
 /// 格式：{"binary":"rg","ts":"2026-11-18T00:00:00Z","parent":"pwsh.exe","cmd":"rg foo"}
-pub fn read_etw_log(path: &PathBuf) -> anyhow::Result<Vec<UsageEvent>> {
+pub fn read_etw_log(path: &Path) -> anyhow::Result<Vec<UsageEvent>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -45,9 +46,13 @@ pub fn read_etw_log(path: &PathBuf) -> anyhow::Result<Vec<UsageEvent>> {
     let mut events = Vec::new();
     for line in raw.lines() {
         let line = line.trim();
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-            let Some(bin) = v.get("binary").and_then(|x| x.as_str()) else { continue };
+            let Some(bin) = v.get("binary").and_then(|x| x.as_str()) else {
+                continue;
+            };
             let ts = v
                 .get("ts")
                 .and_then(|x| x.as_str())
@@ -65,7 +70,7 @@ pub fn read_etw_log(path: &PathBuf) -> anyhow::Result<Vec<UsageEvent>> {
 
 /// 把一条进程事件追加为 JSONL（守护进程侧使用）。
 pub fn append_etw_event(
-    path: &PathBuf,
+    path: &Path,
     binary: &str,
     parent: Option<&str>,
     cmd: Option<&str>,
@@ -80,7 +85,10 @@ pub fn append_etw_event(
         "parent": parent,
         "cmd": cmd,
     });
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     writeln!(f, "{rec}")?;
     Ok(())
 }

@@ -82,12 +82,8 @@ impl Store {
     }
 
     /// 用一次审计结果替换 packages / usage_events 表（全量刷新）。
-    pub fn replace_inventory(
-        &self,
-        packages: &[Package],
-        events: &[UsageEventRow],
-    ) -> Result<()> {
-        let tx = self.conn.untransaction()?;
+    pub fn replace_inventory(&self, packages: &[Package], events: &[UsageEventRow]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM packages", [])?;
         tx.execute("DELETE FROM usage_events", [])?;
         {
@@ -103,7 +99,9 @@ impl Store {
                     p.manager.as_str(),
                     p.version,
                     serde_json::to_string(&p.binaries)?,
-                    p.install_path.as_ref().map(|x| x.to_string_lossy().into_owned()),
+                    p.install_path
+                        .as_ref()
+                        .map(|x| x.to_string_lossy().into_owned()),
                     p.installed_at.map(|t| t.to_rfc3339()),
                     p.size_bytes.map(|x| x as i64),
                     conf_str(p.confidence),
@@ -134,7 +132,7 @@ impl Store {
 
     /// 保存一次判定快照。snapshot_id 建议为 YYYY-MM。
     pub fn save_snapshot(&self, snapshot_id: &str, results: &[VerdictResult]) -> Result<()> {
-        let tx = self.conn.untransaction()?;
+        let tx = self.conn.unchecked_transaction()?;
         let now = Utc::now().to_rfc3339();
         {
             let mut stmt = tx.prepare(
@@ -166,25 +164,30 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT name FROM verdicts WHERE snapshot_id=?1 AND verdict=?2 ORDER BY name",
         )?;
-        let rows = stmt.query_map(params![snapshot_id, verdict.as_str()], |r| r.get::<_, String>(0))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        let rows = stmt.query_map(params![snapshot_id, verdict.as_str()], |r| {
+            r.get::<_, String>(0)
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     /// 列出全部快照 ID。
     pub fn snapshot_ids(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT snapshot_id FROM verdicts ORDER BY snapshot_id",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT snapshot_id FROM verdicts ORDER BY snapshot_id")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     /// 合并配置文件中的忽略项到库。
     pub fn sync_ignores(&self, config: &AuditConfig) -> Result<()> {
-        let tx = self.conn.untransaction()?;
+        let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM ignores", [])?;
         {
-            let mut stmt = tx.prepare("INSERT INTO ignores (pattern, created_at) VALUES (?1,?2)")?;
+            let mut stmt =
+                tx.prepare("INSERT INTO ignores (pattern, created_at) VALUES (?1,?2)")?;
             let now = Utc::now().to_rfc3339();
             for p in &config.ignore {
                 stmt.execute(params![p, now])?;
@@ -196,9 +199,12 @@ impl Store {
 
     /// 读取所有忽略项。
     pub fn ignores(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare("SELECT pattern FROM ignores ORDER BY pattern")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT pattern FROM ignores ORDER BY pattern")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     /// 读取包清单（用于 GUI/报告展示）。
@@ -209,25 +215,30 @@ impl Store {
         )?;
         let rows = stmt.query_map([], |r| {
             let manager = parse_manager(&r.get::<_, String>(1)?)?;
-            let binaries: Vec<String> = serde_json::from_str(&r.get::<_, String>(3)?)
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                    3,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                ))?;
+            let binaries: Vec<String> =
+                serde_json::from_str(&r.get::<_, String>(3)?).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
             let mut p = Package::new(r.get::<_, String>(0)?, manager);
             p.version = r.get(2)?;
             p.install_path = r.get::<_, Option<String>>(4)?.map(std::path::PathBuf::from);
-            p.installed_at = r
-                .get::<_, Option<String>>(5)?
-                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc)));
+            p.installed_at = r.get::<_, Option<String>>(5)?.and_then(|s| {
+                DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|d| d.with_timezone(&Utc))
+            });
             p.size_bytes = r.get::<_, Option<i64>>(6)?.map(|x| x as u64);
             p.confidence = parse_confidence(&r.get::<_, String>(7)?)?;
             p.is_dependency = r.get::<_, i32>(8)? != 0;
             p.binaries = binaries;
             Ok(p)
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 }
 
@@ -268,7 +279,9 @@ fn parse_confidence(s: &str) -> rusqlite::Result<Confidence> {
         "exact" => Ok(Confidence::Exact),
         "inferred" => Ok(Confidence::Inferred),
         "none" => Ok(Confidence::None),
-        other => Err(rusqlite::Error::InvalidColumnName(format!("confidence={other}"))),
+        other => Err(rusqlite::Error::InvalidColumnName(format!(
+            "confidence={other}"
+        ))),
     }
 }
 
@@ -283,18 +296,9 @@ fn parse_manager(s: &str) -> rusqlite::Result<Manager> {
         "brew" => Ok(Manager::Brew),
         "scoop" => Ok(Manager::Scoop),
         "winget" => Ok(Manager::Winget),
-        other => Err(rusqlite::Error::InvalidColumnName(format!("manager={other}"))),
-    }
-}
-
-/// 为 Connection 增加 untransaction 辅助 trait（返回 Transaction）。
-trait Untransaction {
-    fn untransaction(&self) -> Result<rusqlite::Transaction<'_>>;
-}
-
-impl Untransaction for Connection {
-    fn untransaction(&self) -> Result<rusqlite::Transaction<'_>> {
-        self.unchecked_transaction().map_err(Into::into)
+        other => Err(rusqlite::Error::InvalidColumnName(format!(
+            "manager={other}"
+        ))),
     }
 }
 
@@ -317,12 +321,22 @@ mod tests {
             in_shell_config: false,
             evidence: vec![],
         };
-        store.save_snapshot("2026-11", std::slice::from_ref(&r)).unwrap();
-        assert_eq!(store.verdict_names("2026-11", Verdict::Unused).unwrap(), vec!["dusty"]);
+        store
+            .save_snapshot("2026-11", std::slice::from_ref(&r))
+            .unwrap();
+        assert_eq!(
+            store.verdict_names("2026-11", Verdict::Unused).unwrap(),
+            vec!["dusty"]
+        );
 
         r.verdict = Verdict::Active;
-        store.save_snapshot("2026-12", std::slice::from_ref(&r)).unwrap();
-        assert!(store.verdict_names("2026-12", Verdict::Unused).unwrap().is_empty());
+        store
+            .save_snapshot("2026-12", std::slice::from_ref(&r))
+            .unwrap();
+        assert!(store
+            .verdict_names("2026-12", Verdict::Unused)
+            .unwrap()
+            .is_empty());
         assert_eq!(store.snapshot_ids().unwrap(), vec!["2026-11", "2026-12"]);
         assert_eq!(store.packages().unwrap().len(), 1);
     }

@@ -43,9 +43,7 @@ impl Manager {
             // cargo/npm/uv/pipx 都能从清单或 package.json 精确读出 bin 名
             Manager::Cargo | Manager::Npm | Manager::Uv | Manager::Pipx => Confidence::Exact,
             // pip 的 CLI 需从 entry_points / Scripts 目录推断
-            Manager::Pip | Manager::Scoop | Manager::Winget | Manager::Brew => {
-                Confidence::Inferred
-            }
+            Manager::Pip | Manager::Scoop | Manager::Winget | Manager::Brew => Confidence::Inferred,
             // go install 不保留包清单，每个二进制自成一条
             Manager::Go => Confidence::None,
         }
@@ -109,8 +107,7 @@ impl Package {
     /// 判断一个命令名是否属于本包。
     pub fn owns_binary(&self, command: &str) -> bool {
         let command = basename(command);
-        self.binaries.iter().any(|b| basename(b) == command)
-            || basename(&self.name) == command
+        self.binaries.iter().any(|b| basename(b) == command) || basename(&self.name) == command
     }
 }
 
@@ -290,8 +287,6 @@ pub struct AuditConfig {
     pub ignore: Vec<String>,
     /// 只审计这些管理器；空表示全部。
     pub managers: Vec<Manager>,
-    /// 是否在 shell 配置中匹配到裸词就判 integration（宽松模式，偏保守）。
-    pub loose_integration: bool,
 }
 
 impl Default for AuditConfig {
@@ -301,7 +296,6 @@ impl Default for AuditConfig {
             active_hits: None,
             ignore: Vec::new(),
             managers: Vec::new(),
-            loose_integration: true,
         }
     }
 }

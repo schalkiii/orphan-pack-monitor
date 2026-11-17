@@ -11,7 +11,10 @@ pub struct Row {
     pub manager: String,
     pub verdict: Verdict,
     pub typed: String,
+    /// 展示用文案（"Nd ago" / "never"）。
     pub last_run: String,
+    /// 排序用原始天数；None = 无执行记录，排最前。
+    pub last_run_days: Option<u32>,
     pub size: String,
     pub evidence: Vec<String>,
     pub confidence: String,
@@ -93,6 +96,7 @@ pub fn build_rows(
                 .last_exec_days_ago
                 .map(|d| format!("{d}d ago"))
                 .unwrap_or_else(|| "never".into()),
+            last_run_days: r.last_exec_days_ago,
             size: r
                 .package
                 .size_bytes
@@ -104,7 +108,12 @@ pub fn build_rows(
                 r.evidence
                     .iter()
                     .map(|e| match e.last_seen {
-                        Some(t) => format!("[{}] {} · seen {}", e.source.as_str(), e.detail, t.format("%Y-%m-%d")),
+                        Some(t) => format!(
+                            "[{}] {} · seen {}",
+                            e.source.as_str(),
+                            e.detail,
+                            t.format("%Y-%m-%d")
+                        ),
                         None => format!("[{}] {}", e.source.as_str(), e.detail),
                     })
                     .collect()
@@ -116,12 +125,12 @@ pub fn build_rows(
     match sort {
         SortKey::Verdict => rows.sort_by_key(|r| verdict_rank(r.verdict)),
         SortKey::Name => rows.sort_by(|a, b| a.name.cmp(&b.name)),
-        SortKey::Manager => rows.sort_by(|a, b| a.manager.cmp(&b.manager).then(a.name.cmp(&b.name))),
+        SortKey::Manager => {
+            rows.sort_by(|a, b| a.manager.cmp(&b.manager).then(a.name.cmp(&b.name)))
+        }
         SortKey::LastRun => rows.sort_by(|a, b| {
-            // "never" 排最前（最值得清理），其次按天数降序
-            let da = a.last_run.strip_suffix("d ago").and_then(|s| s.parse::<u32>().ok());
-            let db = b.last_run.strip_suffix("d ago").and_then(|s| s.parse::<u32>().ok());
-            match (da, db) {
+            // 无执行记录（never）排最前（最值得清理），其次按天数降序（越久没跑越靠前）
+            match (a.last_run_days, b.last_run_days) {
                 (None, None) => a.name.cmp(&b.name),
                 (None, Some(_)) => std::cmp::Ordering::Less,
                 (Some(_), None) => std::cmp::Ordering::Greater,
