@@ -37,17 +37,39 @@ pub fn generate_script(results: &[VerdictResult], since_days: u32) -> String {
     let _ = writeln!(out, "set -euo pipefail");
     let _ = writeln!(out);
 
+    // 清理候选 = unused 且**不在新装观察期**：装了还没来得及用的包，
+    // 静默不足一个月不能当作弃用证据；被跳过的观察期包也要留痕
     let candidates: Vec<&VerdictResult> = results
         .iter()
-        .filter(|r| r.verdict == Verdict::Unused)
+        .filter(|r| r.verdict == Verdict::Unused && !r.newly_installed)
         .collect();
+    let skipped: Vec<&VerdictResult> = results
+        .iter()
+        .filter(|r| r.verdict == Verdict::Unused && r.newly_installed)
+        .collect();
+    let skipped_note = |out: &mut String| {
+        if !skipped.is_empty() {
+            let _ = writeln!(
+                out,
+                "# {} newly installed package(s) skipped (observation window): {}",
+                skipped.len(),
+                skipped
+                    .iter()
+                    .map(|r| r.package.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    };
 
     if candidates.is_empty() {
         let _ = writeln!(out, "# No unused packages found. Nothing to remove.");
+        skipped_note(&mut out);
         return out;
     }
 
     let _ = writeln!(out, "# {} removal candidate(s)", candidates.len());
+    skipped_note(&mut out);
     let _ = writeln!(out);
     for r in candidates {
         let evidence = if r.evidence.is_empty() {
@@ -129,9 +151,15 @@ pub fn generate_report(results: &[VerdictResult], since_days: u32) -> String {
             } else {
                 "never typed".to_string()
             };
+            // 新装观察期标注：提示「没在用」可能只是「刚装还没用」
+            let obs = if r.newly_installed {
+                " · newly installed (observation)"
+            } else {
+                ""
+            };
             let _ = writeln!(
                 out,
-                "  {:<24} {:<6} {typed} · {last}",
+                "  {:<24} {:<6} {typed} · {last}{obs}",
                 r.package.name, r.package.manager
             );
             for e in &r.evidence {
@@ -156,6 +184,7 @@ mod tests {
             interactive_hits: 0,
             last_exec_days_ago: None,
             in_shell_config: false,
+            newly_installed: false,
             evidence: vec![],
         }
     }
@@ -171,6 +200,30 @@ mod tests {
         assert!(!s.contains("cargo uninstall ripgrep"));
         assert!(s.contains("# 1 removal candidate(s)"));
         assert!(s.contains("no signal from any source"));
+    }
+
+    #[test]
+    fn newly_installed_packages_are_skipped_in_script() {
+        let mut fresh = result("fresh-tool", Manager::Cargo, Verdict::Unused);
+        fresh.newly_installed = true;
+        let results = vec![fresh, result("dusty", Manager::Cargo, Verdict::Unused)];
+        let s = generate_script(&results, 30);
+        // 观察期包不进清理命令，但要在说明里留痕
+        assert!(!s.contains("cargo uninstall fresh-tool"));
+        assert!(s.contains("cargo uninstall dusty"));
+        assert!(s.contains("newly installed package(s) skipped"));
+        assert!(s.contains("fresh-tool"));
+
+        // 全部是观察期：无候选，但说明仍列出
+        let only_fresh = generate_script(
+            &[VerdictResult {
+                newly_installed: true,
+                ..result("fresh-tool", Manager::Cargo, Verdict::Unused)
+            }],
+            30,
+        );
+        assert!(!only_fresh.contains("cargo uninstall"));
+        assert!(only_fresh.contains("observation window"));
     }
 
     #[test]

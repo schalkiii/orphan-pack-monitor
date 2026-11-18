@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    # Windows 优先（ETW/atime/PSReadLine 均为 Windows 信号源）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check (workspace)
+        run: cargo fmt --all -- --check
+      - name: Test (workspace)
+        run: cargo test --workspace
+      - name: Clippy (workspace)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Format check (gui)
+        working-directory: gui
+        run: cargo fmt --all -- --check
+      - name: Test (gui, pure view-layer tests only)
+        working-directory: gui
+        run: cargo test
+      - name: Clippy (gui)
+        working-directory: gui
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Format check (etw-capture)
+        working-directory: etw-capture
+        run: cargo fmt --all -- --check
+      - name: Test (etw-capture)
+        working-directory: etw-capture
+        run: cargo test
+      - name: Clippy (etw-capture)
+        working-directory: etw-capture
+        run: cargo clippy --all-targets -- -D warnings

@@ -14,7 +14,8 @@ use std::process::Command;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// Windows 子进程隐藏控制台窗口标志；run_command 与 etw/signals 的探测命令共用。
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// 统一执行外部命令并返回 stdout。Windows 下隐藏控制台窗口。
 pub fn run_command(mut cmd: Command) -> Result<String> {
@@ -60,18 +61,11 @@ pub fn cargo_home() -> PathBuf {
         .join(".cargo")
 }
 
-/// 解析 cargo 的 .crates2.json，得到 包名 -> [二进制名] 的精确映射。
+/// 解析 .crates2.json 文本（纯函数，便于单测）。
 /// 结构：{ "installs": { "crate-name version (source)": { "version_req", "bins": [...], ... } } }
-pub fn collect_cargo() -> Result<Vec<Package>> {
-    let home = cargo_home();
-    let meta = home.join(".crates2.json");
-    if !meta.exists() {
-        return Ok(Vec::new());
-    }
-    let raw =
-        std::fs::read_to_string(&meta).with_context(|| format!("reading {}", meta.display()))?;
+pub fn parse_crates2(raw: &str, cargo_bin_dir: PathBuf) -> Result<Vec<Package>> {
     let json: serde_json::Value =
-        serde_json::from_str(&raw).with_context(|| "parsing .crates2.json")?;
+        serde_json::from_str(raw).with_context(|| "parsing .crates2.json")?;
     let mut packages = Vec::new();
     if let Some(installs) = json.get("installs").and_then(|v| v.as_object()) {
         for (key, val) in installs {
@@ -98,13 +92,25 @@ pub fn collect_cargo() -> Result<Vec<Package>> {
             let mut p = Package::new(name, Manager::Cargo);
             p.version = version;
             p.binaries = binaries;
-            p.install_path = Some(home.join("bin"));
+            p.install_path = Some(cargo_bin_dir.clone());
             p.confidence = Confidence::Exact;
             packages.push(p);
         }
     }
     packages.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(packages)
+}
+
+/// 采集 cargo 全局安装（读 CARGO_HOME/.crates2.json）。
+pub fn collect_cargo() -> Result<Vec<Package>> {
+    let home = cargo_home();
+    let meta = home.join(".crates2.json");
+    if !meta.exists() {
+        return Ok(Vec::new());
+    }
+    let raw =
+        std::fs::read_to_string(&meta).with_context(|| format!("reading {}", meta.display()))?;
+    parse_crates2(&raw, home.join("bin"))
 }
 
 // ---------------------------------------------------------------------------
@@ -128,7 +134,9 @@ fn npm_prefix() -> Result<PathBuf> {
 }
 
 /// 解析 npm package.json 的 bin 字段（string 或 object 两种形态）。
-fn npm_bin_names(pkg_json: &Path) -> Vec<String> {
+/// 字符串形态 `{"bin": "bin/x.js"}` 时 npm 创建的可执行名是**包名**
+/// （scoped 包取末段），不是脚本文件名——与 npm 实际行为一致。
+fn npm_bin_names(pkg_json: &Path, package_name: &str) -> Vec<String> {
     let Ok(raw) = std::fs::read_to_string(pkg_json) else {
         return Vec::new();
     };
@@ -139,7 +147,7 @@ fn npm_bin_names(pkg_json: &Path) -> Vec<String> {
         return Vec::new();
     };
     match bin {
-        serde_json::Value::String(s) => vec![strip_exe(basename(s)).to_string()],
+        serde_json::Value::String(_) => vec![strip_exe(basename(package_name)).to_string()],
         serde_json::Value::Object(map) => map
             .keys()
             .map(|k| strip_exe(basename(k)).to_string())
@@ -156,8 +164,9 @@ pub fn collect_npm() -> Result<Vec<Package>> {
     cmd.args(["ls", "-g", "--json", "--depth=0"]);
     let out = run_command(cmd)?;
     let list: NpmList = serde_json::from_str(&out).with_context(|| "parsing npm ls -g --json")?;
-    let prefix = npm_prefix().unwrap_or_default();
-    let modules_root = prefix.join("node_modules");
+    // prefix 探测失败时置 None（atime/观察期对无路径包自然跳过），
+    // 而非空 PathBuf 拼出相对路径 node_modules/<pkg> 的垃圾数据
+    let modules_root = npm_prefix().ok().map(|p| p.join("node_modules"));
 
     let mut packages = Vec::new();
     for (name, meta) in list.dependencies {
@@ -165,9 +174,12 @@ pub fn collect_npm() -> Result<Vec<Package>> {
             .get("version")
             .and_then(|v| v.as_str())
             .map(str::to_string);
-        let install_path = modules_root.join(&name);
-        // 精确映射：读包自己的 package.json
-        let binaries = npm_bin_names(&install_path.join("package.json"));
+        let install_path = modules_root.as_ref().map(|m| m.join(&name));
+        // 精确映射：读包自己的 package.json（prefix 失败无路径 -> 无法读取 -> 空，同旧行为）
+        let binaries = install_path
+            .as_ref()
+            .map(|p| npm_bin_names(&p.join("package.json"), &name))
+            .unwrap_or_default();
         let confidence = if binaries.is_empty() {
             // 没有 bin 字段的全局包通常是纯库，不提供 CLI -> 不纳入路线 B 的匹配
             Confidence::None
@@ -177,7 +189,7 @@ pub fn collect_npm() -> Result<Vec<Package>> {
         let mut p = Package::new(name, Manager::Npm);
         p.version = version;
         p.binaries = binaries;
-        p.install_path = Some(install_path);
+        p.install_path = install_path;
         p.confidence = confidence;
         packages.push(p);
     }
@@ -222,6 +234,11 @@ print(json.dumps(out))
     let mut cmd = Command::new(py);
     cmd.args(["-c", script]);
     let out = run_command(cmd)?;
+    parse_pip_entrypoints(&out)
+}
+
+/// 解析 python entry_points 探测脚本的 JSON 输出（纯函数，便于单测）。
+pub fn parse_pip_entrypoints(out: &str) -> Result<Vec<Package>> {
     let rows: Vec<serde_json::Value> =
         serde_json::from_str(out.trim()).with_context(|| "parsing python entry points json")?;
     let mut packages = Vec::new();
@@ -240,7 +257,7 @@ print(json.dumps(out))
             .map(|a| {
                 a.iter()
                     .filter_map(|x| x.as_str())
-                    .map(str::to_string)
+                    .map(|s| s.to_string())
                     .collect()
             })
             .unwrap_or_default();
@@ -254,14 +271,9 @@ print(json.dumps(out))
     Ok(packages)
 }
 
-/// `uv tool list` 输出解析：形如 "dusty v0.1.0\n- dusty\n- dustbin"。
-pub fn collect_uv() -> Result<Vec<Package>> {
-    if !tool_available("uv") {
-        return Ok(Vec::new());
-    }
-    let mut cmd = Command::new("uv");
-    cmd.args(["tool", "list"]);
-    let out = run_command(cmd)?;
+/// `uv tool list` 输出解析（纯函数，便于单测）：
+/// 头行 "name vX.Y.Z"（或 "name vX.Y.Z (path)"），子行 "- bin"。
+pub fn parse_uv_list(out: &str) -> Vec<Package> {
     let mut packages = Vec::new();
     let mut current: Option<Package> = None;
     for line in out.lines() {
@@ -277,14 +289,20 @@ pub fn collect_uv() -> Result<Vec<Package>> {
             if let Some(p) = current.take() {
                 packages.push(p);
             }
-            // 格式: "name vX.Y.Z" 或 "name vX.Y.Z (path)"
+            // 格式: "name vX.Y.Z" 或 "name vX.Y.Z (path)"，path 段是 venv 目录
+            // （atime 探测与新装观察期都依赖 install_path，不能丢）
             let mut parts = trimmed.split_whitespace();
             let name = parts.next().unwrap_or("").to_string();
             let version = parts
                 .find(|s| s.starts_with('v'))
                 .map(|s| s[1..].to_string());
+            let install_path = trimmed
+                .find('(')
+                .and_then(|i| trimmed[i + 1..].strip_suffix(')'))
+                .map(PathBuf::from);
             let mut p = Package::new(name, Manager::Uv);
             p.version = version;
+            p.install_path = install_path;
             p.confidence = Confidence::Exact;
             current = Some(p);
         }
@@ -292,21 +310,30 @@ pub fn collect_uv() -> Result<Vec<Package>> {
     if let Some(p) = current {
         packages.push(p);
     }
-    Ok(packages)
+    packages
 }
 
-/// `pipx list --json` 输出解析。
-pub fn collect_pipx() -> Result<Vec<Package>> {
-    if !tool_available("pipx") {
+pub fn collect_uv() -> Result<Vec<Package>> {
+    if !tool_available("uv") {
         return Ok(Vec::new());
     }
-    let mut cmd = Command::new("pipx");
-    cmd.args(["list", "--json"]);
+    let mut cmd = Command::new("uv");
+    cmd.args(["tool", "list"]);
     let out = run_command(cmd)?;
+    Ok(parse_uv_list(&out))
+}
+
+/// `pipx list --json` 输出解析（纯函数，便于单测）。
+pub fn parse_pipx_json(out: &str) -> Result<Vec<Package>> {
     let json: serde_json::Value =
-        serde_json::from_str(&out).with_context(|| "parsing pipx list --json")?;
+        serde_json::from_str(out).with_context(|| "parsing pipx list --json")?;
     let mut packages = Vec::new();
     if let Some(venvs) = json.get("venvs").and_then(|v| v.as_object()) {
+        // pipx venvs 固定布局：<PIPX_HOME>/venvs/<name>（默认 %LOCALAPPDATA%\pipx）。
+        // install_path 供 atime 探测与新装观察期使用。
+        let pipx_home = std::env::var_os("PIPX_HOME")
+            .map(PathBuf::from)
+            .or_else(|| dirs::data_local_dir().map(|d| d.join("pipx")));
         for (name, val) in venvs {
             let mut p = Package::new(name, Manager::Pipx);
             p.version = val
@@ -321,15 +348,26 @@ pub fn collect_pipx() -> Result<Vec<Package>> {
                 .map(|a| {
                     a.iter()
                         .filter_map(|x| x.as_str())
-                        .map(str::to_string)
+                        .map(|s| s.to_string())
                         .collect()
                 })
                 .unwrap_or_default();
+            p.install_path = pipx_home.as_ref().map(|h| h.join("venvs").join(name));
             p.confidence = Confidence::Exact;
             packages.push(p);
         }
     }
     Ok(packages)
+}
+
+pub fn collect_pipx() -> Result<Vec<Package>> {
+    if !tool_available("pipx") {
+        return Ok(Vec::new());
+    }
+    let mut cmd = Command::new("pipx");
+    cmd.args(["list", "--json"]);
+    let out = run_command(cmd)?;
+    parse_pipx_json(&out)
 }
 
 /// 汇总全部可用的采集器。单个采集器失败不影响其余（降级为警告）。
@@ -386,30 +424,77 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let pj = dir.join("package.json");
         std::fs::write(&pj, r#"{"bin":{"tool":"bin/tool.js","other":"bin/o.js"}}"#).unwrap();
-        let mut bins = npm_bin_names(&pj);
+        let mut bins = npm_bin_names(&pj, "pkg");
         bins.sort();
         assert_eq!(bins, vec!["other", "tool"]);
+        // 字符串形态的可执行名是包名（scoped 包取末段），不是脚本文件名
         std::fs::write(&pj, r#"{"bin":"bin/single.js"}"#).unwrap();
-        assert_eq!(npm_bin_names(&pj), vec!["single.js"]);
+        assert_eq!(npm_bin_names(&pj, "single"), vec!["single"]);
+        assert_eq!(npm_bin_names(&pj, "@scope/tool"), vec!["tool"]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn cargo_meta_parsing_shape() {
-        // 验证 .crates2.json 的字段假设与本机实际结构一致
-        let home = cargo_home();
-        let meta = home.join(".crates2.json");
-        if !meta.exists() {
-            return;
-        }
-        let raw = std::fs::read_to_string(&meta).unwrap();
-        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let installs = json.get("installs").and_then(|v| v.as_object());
-        assert!(installs.is_some(), ".crates2.json should have 'installs'");
-        let first = installs.unwrap().values().next().unwrap();
-        assert!(
-            first.get("bins").is_some() || first.get("binaries").is_some(),
-            "entry should have 'bins' or 'binaries'"
+    fn crates2_parsing_shape() {
+        // 内置 fixture 替代真机 .crates2.json，避免文件缺失时测试空转
+        let raw = r#"{"installs":{"ripgrep 14.1.0 (registry+https://github.com/rust-lang/crates.io-index)":{"version_req":"=14.1.0","bins":["rg"]},"oldtool 0.1.0 (registry+…)":{"binaries":["oldtool"]}}}"#;
+        let ps = parse_crates2(raw, PathBuf::from(r"C:\u\.cargo\bin")).unwrap();
+        assert_eq!(ps.len(), 2);
+        assert_eq!(ps[0].name, "oldtool"); // 按名排序
+        assert_eq!(ps[0].binaries, vec!["oldtool"]); // 旧版字段兼容
+        assert_eq!(ps[1].name, "ripgrep");
+        assert_eq!(ps[1].version.as_deref(), Some("14.1.0"));
+        assert_eq!(ps[1].binaries, vec!["rg"]);
+        assert_eq!(
+            ps[1].install_path.as_deref(),
+            Some(std::path::Path::new(r"C:\u\.cargo\bin"))
+        );
+    }
+
+    #[test]
+    fn uv_list_parses_headers_bins_and_path_suffix() {
+        let out = "dusty v0.1.0\n- dusty\n- dustbin\n\nother v2.0.1 (C:\\tools\\other)\n- other\n";
+        let ps = parse_uv_list(out);
+        assert_eq!(ps.len(), 2);
+        assert_eq!(ps[0].name, "dusty");
+        assert_eq!(ps[0].version.as_deref(), Some("0.1.0"));
+        assert_eq!(ps[0].binaries, vec!["dusty", "dustbin"]);
+        assert_eq!(ps[1].name, "other");
+        assert_eq!(ps[1].version.as_deref(), Some("2.0.1")); // "(path)" 后缀不污染版本
+        assert_eq!(ps[1].binaries, vec!["other"]);
+        // "(path)" 段是 venv 目录，必须保留（atime 与新装观察期依赖）
+        assert_eq!(
+            ps[1].install_path.as_deref(),
+            Some(std::path::Path::new(r"C:\tools\other"))
+        );
+        assert!(ps[0].install_path.is_none()); // 无 path 段的行保持 None
+        assert!(parse_uv_list("").is_empty());
+    }
+
+    #[test]
+    fn pipx_json_parses_venvs_apps_and_version() {
+        let out = r#"{"venvs":{"ruff":{"metadata":{"main_package":{"version":"0.8.0"}},"apps":["ruff","ruff-lsp"]}}}"#;
+        let ps = parse_pipx_json(out).unwrap();
+        assert_eq!(ps.len(), 1);
+        assert_eq!(ps[0].name, "ruff");
+        assert_eq!(ps[0].version.as_deref(), Some("0.8.0"));
+        assert_eq!(ps[0].binaries, vec!["ruff", "ruff-lsp"]);
+        // install_path 按 <PIPX_HOME>/venvs/<name> 推断（venvs 布局固定）
+        let ip = ps[0].install_path.as_ref().expect("pipx install_path");
+        assert!(ip.ends_with("ruff"), "got {}", ip.display());
+        assert_eq!(parse_pipx_json("{}").unwrap(), Vec::<Package>::new());
+    }
+
+    #[test]
+    fn pip_entrypoints_parses_name_binaries_location() {
+        let out = r#"[{"name":"httpie","version":"3.2.0","binaries":["http","https"],"location":"C:\\py\\Lib\\site-packages"},{"version":"1.0"}]"#;
+        let ps = parse_pip_entrypoints(out).unwrap();
+        assert_eq!(ps.len(), 1); // 缺 name 的行跳过
+        assert_eq!(ps[0].name, "httpie");
+        assert_eq!(ps[0].binaries, vec!["http", "https"]);
+        assert_eq!(
+            ps[0].install_path,
+            Some(PathBuf::from("C:\\py\\Lib\\site-packages"))
         );
     }
 }

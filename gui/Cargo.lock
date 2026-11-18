@@ -3288,7 +3288,7 @@ dependencies = [
 
 [[package]]
 name = "orphan-audit-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3301,7 +3301,7 @@ dependencies = [
 
 [[package]]
 name = "orphan-audit-gui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gpui-pre",
  "gpui-pre-platform",

@@ -1,9 +1,7 @@
 //! 存储层：SQLite 持久化包清单、事件、判定与历史快照。
 //! 保留快照是为了支持「漂移对比」——diff 本月与上月的 active 集合。
 
-use crate::model::{
-    AuditConfig, Confidence, Manager, Package, SignalSource, Verdict, VerdictResult,
-};
+use crate::model::{Confidence, Manager, Package, SignalSource, Verdict, VerdictResult};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
@@ -71,10 +69,6 @@ impl Store {
                 evidence TEXT NOT NULL,
                 computed_at TEXT NOT NULL,
                 PRIMARY KEY (snapshot_id, name, manager)
-            );
-            CREATE TABLE IF NOT EXISTS ignores (
-                pattern TEXT PRIMARY KEY,
-                created_at TEXT NOT NULL
             );
             "#,
         )?;
@@ -181,30 +175,65 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// 合并配置文件中的忽略项到库。
-    pub fn sync_ignores(&self, config: &AuditConfig) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM ignores", [])?;
-        {
-            let mut stmt =
-                tx.prepare("INSERT INTO ignores (pattern, created_at) VALUES (?1,?2)")?;
-            let now = Utc::now().to_rfc3339();
-            for p in &config.ignore {
-                stmt.execute(params![p, now])?;
+    /// 某包在 exclude_snapshot 之前**连续**判 unused 的快照数（漂移即信号：
+    /// 连续多月 unused 比单月 unused 更接近可删；快照 ID 为 YYYY-MM 字符串，
+    /// 字典序即时间序，只统计严格更早的快照，从最新往回数到首个非 unused 为止）。
+    pub fn unused_streak_months(
+        &self,
+        name: &str,
+        manager: &str,
+        exclude_snapshot: &str,
+    ) -> Result<u32> {
+        let mut stmt = self.conn.prepare(
+            "SELECT verdict FROM verdicts
+             WHERE name=?1 AND manager=?2 AND snapshot_id<?3
+             ORDER BY snapshot_id DESC",
+        )?;
+        let rows = stmt.query_map(params![name, manager, exclude_snapshot], |r| {
+            r.get::<_, String>(0)
+        })?;
+        let mut streak = 0u32;
+        for verdict in rows.flatten() {
+            if verdict == "unused" {
+                streak += 1;
+            } else {
+                break;
             }
         }
-        tx.commit()?;
-        Ok(())
+        Ok(streak)
     }
 
-    /// 读取所有忽略项。
-    pub fn ignores(&self) -> Result<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT pattern FROM ignores ORDER BY pattern")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+    /// 读取全部使用事件（离线模式重建判定用；对应 replace_inventory 写入的行）。
+    pub fn events(&self) -> Result<Vec<crate::model::UsageEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT binary, occurred_at, source, command_line, parent, count FROM usage_events",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, i64>(5)?,
+            ))
+        })?;
+        let mut events = Vec::new();
+        for (binary, occurred_at, source, command_line, parent, count) in rows.flatten() {
+            // 未知来源（老库/手改数据）跳过该行，不影响其余事件
+            let Some(source) = parse_source(&source) else {
+                continue;
+            };
+            let timestamp = DateTime::parse_from_rfc3339(&occurred_at)
+                .map(|d| d.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            let mut ev = crate::model::UsageEvent::new(binary, timestamp, source);
+            ev.command_line = command_line;
+            ev.parent = parent;
+            ev.count = count.max(1) as u32;
+            events.push(ev);
+        }
+        Ok(events)
     }
 
     /// 读取包清单（用于 GUI/报告展示）。
@@ -302,6 +331,20 @@ fn parse_manager(s: &str) -> rusqlite::Result<Manager> {
     }
 }
 
+/// 事件来源字符串还原（写入侧见 SignalSource::as_str）。
+fn parse_source(s: &str) -> Option<SignalSource> {
+    match s {
+        "history" => Some(SignalSource::History),
+        "etw" => Some(SignalSource::Etw),
+        "atime" => Some(SignalSource::Atime),
+        "shell-config" => Some(SignalSource::ShellConfig),
+        "alias" => Some(SignalSource::Alias),
+        "wrapped" => Some(SignalSource::Wrapped),
+        "drift" => Some(SignalSource::Drift),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +362,7 @@ mod tests {
             interactive_hits: 0,
             last_exec_days_ago: None,
             in_shell_config: false,
+            newly_installed: false,
             evidence: vec![],
         };
         store
@@ -339,5 +383,82 @@ mod tests {
             .is_empty());
         assert_eq!(store.snapshot_ids().unwrap(), vec!["2026-11", "2026-12"]);
         assert_eq!(store.packages().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unused_streak_counts_consecutive_snapshots_only() {
+        let store = Store::in_memory().unwrap();
+        let p = Package::new("dusty", Manager::Cargo);
+        let mk = |v: Verdict| VerdictResult {
+            package: p.clone(),
+            verdict: v,
+            interactive_hits: 0,
+            last_exec_days_ago: None,
+            in_shell_config: false,
+            newly_installed: false,
+            evidence: vec![],
+        };
+        // 2026-06 active，2026-07/08/09 连续 unused
+        store
+            .save_snapshot("2026-06", &[mk(Verdict::Active)])
+            .unwrap();
+        store
+            .save_snapshot("2026-07", &[mk(Verdict::Unused)])
+            .unwrap();
+        store
+            .save_snapshot("2026-08", &[mk(Verdict::Unused)])
+            .unwrap();
+        store
+            .save_snapshot("2026-09", &[mk(Verdict::Unused)])
+            .unwrap();
+        // 截至当前快照 2026-10：连续 3 个 unused
+        assert_eq!(
+            store
+                .unused_streak_months("dusty", "cargo", "2026-10")
+                .unwrap(),
+            3
+        );
+        // 当前快照被排除：查 2026-09 时只数 07/08 两个月
+        assert_eq!(
+            store
+                .unused_streak_months("dusty", "cargo", "2026-09")
+                .unwrap(),
+            2
+        );
+        // 首个非 unused（06 active）截断计数
+        assert_eq!(
+            store
+                .unused_streak_months("dusty", "cargo", "2026-07")
+                .unwrap(),
+            0
+        );
+        // 无历史记录
+        assert_eq!(
+            store
+                .unused_streak_months("ghost", "cargo", "2026-10")
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn events_roundtrip_after_replace() {
+        let store = Store::in_memory().unwrap();
+        let mut p = Package::new("dusty", Manager::Cargo);
+        p.binaries = vec!["dusty".into()];
+
+        let now = Utc::now();
+        let mut ev = crate::model::UsageEvent::new("dusty", now, SignalSource::History);
+        ev.command_line = Some("dusty run".into());
+        ev.count = 5;
+        let rows = vec![UsageEventRow::from(&ev)];
+        store.replace_inventory(&[p], &rows).unwrap();
+
+        let events = store.events().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].binary, "dusty");
+        assert_eq!(events[0].source, SignalSource::History);
+        assert_eq!(events[0].count, 5);
+        assert_eq!(events[0].command_line.as_deref(), Some("dusty run"));
     }
 }

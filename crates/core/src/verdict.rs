@@ -34,6 +34,12 @@ pub fn evaluate(
 ) -> VerdictResult {
     let mut evidence: Vec<Evidence> = Vec::new();
 
+    // since 窗口判定（提前定义：事件循环里 ETW 计数就要用它过滤）
+    let in_window = |t: DateTime<Utc>| {
+        let age = now.signed_duration_since(t).num_days();
+        age >= 0 && age <= config.since_days as i64
+    };
+
     // 按来源归类事件，同时统计最近时间与命中数
     let mut interactive_hits: u32 = 0;
     let mut last_exec: Option<DateTime<Utc>> = None;
@@ -50,6 +56,11 @@ pub fn evaluate(
                 interactive_hits += count;
             }
             SignalSource::Etw => {
+                // 只统计窗口内事件：窗口外的旧执行不进证据链——
+                // "executed 5x" 若混入半年前的旧事件会误导「近期」语义
+                if !in_window(ev.timestamp) {
+                    continue;
+                }
                 etw_hits += count;
                 // 执行证据取所有执行类事件的最新时间
                 if last_exec.is_none_or(|t| ev.timestamp > t) {
@@ -71,6 +82,9 @@ pub fn evaluate(
             SignalSource::ShellConfig | SignalSource::Alias => {
                 // 这两类单独走 shell_config_mentions，此处仅计数展示
             }
+            // 漂移不出现在 UsageEvent（只用于证据链富化，见 lib::enrich_with_drift），
+            // 事件流里出现该来源属于异常数据，忽略即可
+            SignalSource::Drift => {}
         }
     }
 
@@ -110,10 +124,6 @@ pub fn evaluate(
     let threshold = config
         .active_hits
         .unwrap_or_else(|| adaptive_active_hits(history_total));
-    let in_window = |t: DateTime<Utc>| {
-        let age = now.signed_duration_since(t).num_days();
-        age >= 0 && age <= config.since_days as i64
-    };
     let has_recent_exec = last_exec.is_some_and(in_window);
     let in_shell_config = !shell_config_mentions.is_empty();
 
@@ -144,12 +154,19 @@ pub fn evaluate(
     let last_exec_days_ago =
         last_exec.map(|t| now.signed_duration_since(t).num_days().max(0) as u32);
 
+    // 新装观察期：安装时间在 since 窗口内。观察期不改变判定档位，
+    // 只在处置层把包挡在清理候选外（见 actions / GUI 预览）。
+    let newly_installed = package.installed_at.is_some_and(|t| {
+        now.signed_duration_since(t).num_days().max(0) <= config.since_days as i64
+    });
+
     VerdictResult {
         package: package.clone(),
         verdict,
         interactive_hits,
         last_exec_days_ago,
         in_shell_config,
+        newly_installed,
         evidence,
     }
 }
@@ -182,11 +199,12 @@ pub fn evaluate_all(
                 .cloned()
                 .collect();
 
-            // shell 配置引用：任一 bin 名或包名在索引里
+            // shell 配置引用：任一 bin 名或包名在索引里。
+            // 索引键统一小写（见 signals::index_config_line），查询侧同样小写化。
             let mut mentions: Vec<String> = Vec::new();
             let mut seen = std::collections::HashSet::new();
             for key in p.binaries.iter().chain(std::iter::once(&p.name)) {
-                if let Some(locs) = shell_config_index.get(basename(key)) {
+                if let Some(locs) = shell_config_index.get(&basename(key).to_ascii_lowercase()) {
                     for loc in locs {
                         if seen.insert(loc.clone()) {
                             mentions.push(loc.clone());
@@ -328,6 +346,26 @@ mod tests {
     }
 
     #[test]
+    fn shell_config_lookup_is_case_insensitive() {
+        // 配置里 `Set-Alias Cat BAT` 建立的索引键是 "bat"（小写），
+        // 包的 binaries 大小写任意（"Bat"）都必须命中 -> integration 而非 unused
+        let mut index = std::collections::HashMap::new();
+        index.insert("bat".to_string(), vec!["profile.ps1:3 (alias)".to_string()]);
+        let mut p = Package::new("bat", Manager::Cargo);
+        p.binaries = vec!["Bat".into()];
+        let results = evaluate_all(
+            &[p],
+            &[],
+            &index,
+            &AuditConfig::default(),
+            1000,
+            fixed_now(),
+        );
+        assert_eq!(results[0].verdict, Verdict::Integration);
+        assert!(results[0].in_shell_config);
+    }
+
+    #[test]
     fn precedence_recent_exec_beats_shell_config() {
         // 同时有 shell 配置和近期执行 -> indirect 优先于 integration
         let now = fixed_now();
@@ -341,6 +379,38 @@ mod tests {
             now,
         );
         assert_eq!(r.verdict, Verdict::Indirect);
+    }
+
+    #[test]
+    fn etw_evidence_counts_only_events_inside_window() {
+        let now = fixed_now();
+        // 窗口外（60 天前）的 ETW 事件：不进证据链、不判 indirect
+        let old = now - chrono::Duration::days(60);
+        let mut ev_old = UsageEvent::new("dusty", old, SignalSource::Etw);
+        ev_old.parent = Some("make.exe".into());
+        let r = evaluate(
+            &pkg("dusty-tool", "dusty"),
+            &[ev_old],
+            &[],
+            &AuditConfig::default(),
+            1000,
+            now,
+        );
+        assert_eq!(r.verdict, Verdict::Unused);
+        assert!(!r.evidence.iter().any(|e| e.source == SignalSource::Etw));
+
+        // 窗口内事件正常计数与归因
+        let ev_new = UsageEvent::new("dusty", now, SignalSource::Etw);
+        let r = evaluate(
+            &pkg("dusty-tool", "dusty"),
+            &[ev_new],
+            &[],
+            &AuditConfig::default(),
+            1000,
+            now,
+        );
+        assert_eq!(r.verdict, Verdict::Indirect);
+        assert!(r.evidence.iter().any(|e| e.detail.contains("executed 1x")));
     }
 
     #[test]
@@ -382,5 +452,33 @@ mod tests {
         let results = evaluate_all(&[dep, ignored, normal], &[], &map, &cfg, 1000, fixed_now());
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].package.name, "normal");
+    }
+
+    #[test]
+    fn recent_install_flags_newly_installed() {
+        let now = fixed_now();
+        let mut fresh = pkg("fresh-tool", "fresh");
+        fresh.installed_at = Some(now - chrono::Duration::days(10));
+        let mut stale = pkg("stale-tool", "stale");
+        stale.installed_at = Some(now - chrono::Duration::days(120));
+
+        let r_fresh = evaluate(&fresh, &[], &[], &AuditConfig::default(), 1000, now);
+        let r_stale = evaluate(&stale, &[], &[], &AuditConfig::default(), 1000, now);
+        // 观察期标志独立于判定档位：两者都判 unused，但新装的带观察期标志
+        assert_eq!(r_fresh.verdict, Verdict::Unused);
+        assert!(r_fresh.newly_installed);
+        assert_eq!(r_stale.verdict, Verdict::Unused);
+        assert!(!r_stale.newly_installed);
+
+        // 安装时间缺失（采集层拿不到）：不视为新装
+        let r_none = evaluate(
+            &pkg("unknown", "unknown"),
+            &[],
+            &[],
+            &AuditConfig::default(),
+            1000,
+            now,
+        );
+        assert!(!r_none.newly_installed);
     }
 }

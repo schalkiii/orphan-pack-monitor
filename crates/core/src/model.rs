@@ -117,7 +117,8 @@ impl Package {
 pub enum SignalSource {
     /// shell 历史：用户显式敲过的命令（最强交互证据）。
     History,
-    /// ETW 进程事件：系统级精确执行记录，含父进程与命令行。
+    /// ETW 进程事件：系统级精确执行记录，含父进程归因与精确计数
+    /// （命令行字段在较新 Windows 构建已从内核事件移除，见 etw-capture/DESIGN.md）。
     Etw,
     /// 文件访问时间：只能证明「跑过」，不能证明「谁跑、跑几次」。
     Atime,
@@ -127,6 +128,9 @@ pub enum SignalSource {
     Alias,
     /// 命令行里被 wrapper（sudo/env/xargs）包裹后还原出的真实命令。
     Wrapped,
+    /// 历史快照漂移：连续多个月快照均判 unused（长期未用的横向证据，
+    /// 不出现在 UsageEvent 里，只用于证据链富化）。
+    Drift,
 }
 
 impl SignalSource {
@@ -138,6 +142,7 @@ impl SignalSource {
             SignalSource::ShellConfig => "shell-config",
             SignalSource::Alias => "alias",
             SignalSource::Wrapped => "wrapped",
+            SignalSource::Drift => "drift",
         }
     }
 }
@@ -151,7 +156,8 @@ pub struct UsageEvent {
     pub timestamp: DateTime<Utc>,
     /// 信号来源。
     pub source: SignalSource,
-    /// 原始命令行（若可得）。ETW 提供完整命令行，history 提供原始行。
+    /// 原始命令行（若可得）。shell 历史提供原始行；ETW 的 CommandLine 字段在较新
+    /// Windows 构建已从内核事件移除（见 etw-capture/DESIGN.md），常态为 None。
     pub command_line: Option<String>,
     /// 父进程名（ETW 特有）。用于区分用户 shell 直接调用 vs 脚本/CI/agent 调用。
     pub parent: Option<String>,
@@ -221,7 +227,9 @@ impl Verdict {
             Verdict::Indirect => "Executed recently, but not by you typing it",
             Verdict::Rare => "Typed occasionally, and nothing has run it lately",
             Verdict::Integration => "Never executed, but referenced by shell config",
-            Verdict::Unused => "No signal from any source — removal candidate",
+            // 口径是「审计窗口内」：窗口外的旧 atime 证据可以并存于证据链
+            // （带日期展示），与本描述不矛盾
+            Verdict::Unused => "No signal from any source in the audit window — removal candidate",
         }
     }
 }
@@ -272,6 +280,9 @@ pub struct VerdictResult {
     pub last_exec_days_ago: Option<u32>,
     /// 是否出现在 shell 配置中。
     pub in_shell_config: bool,
+    /// 是否处于新装观察期（安装时间在 since 窗口内）。观察期包不进入清理
+    /// 候选：装了还没来得及用很正常，不足一个月的静默不能当作弃用证据。
+    pub newly_installed: bool,
     /// 完整证据链。
     pub evidence: Vec<Evidence>,
 }

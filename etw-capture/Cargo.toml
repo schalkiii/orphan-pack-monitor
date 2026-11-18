@@ -1,0 +1,15 @@
+[package]
+name = "orphan-audit-etw-capture"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "ETW capture component: record process creations to events.jsonl for orphan-audit"
+
+[dependencies]
+orphan-audit-core = { path = "../crates/core" }
+ferrisetw = "1.2"
+anyhow = "1"
+ctrlc = "3"
+
+[workspace]

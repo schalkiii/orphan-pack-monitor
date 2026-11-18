@@ -123,6 +123,17 @@ fn default_db() -> PathBuf {
         .join("orphan-audit.db")
 }
 
+/// 快照漂移：返回（新增, 移除）包名集合。a=旧快照，b=新快照。
+fn diff_names(
+    a: &std::collections::BTreeSet<String>,
+    b: &std::collections::BTreeSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    (
+        b.difference(a).cloned().collect(),
+        a.difference(b).cloned().collect(),
+    )
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let since_days = parse_since(&cli.since)?;
@@ -211,19 +222,27 @@ fn main() -> Result<()> {
                 println!("Available snapshots: {}", ids.join(", "));
                 return Ok(());
             }
+            // 不存在的快照名按空集 diff 会把所有包显示为 removed，必须先校验
+            for s in [&old, &new] {
+                if !ids.contains(s) {
+                    anyhow::bail!(
+                        "snapshot '{s}' not found; available snapshots: {}",
+                        ids.join(", ")
+                    );
+                }
+            }
             use orphan_audit_core::model::Verdict;
             for v in [Verdict::Active, Verdict::Unused] {
                 let a: std::collections::BTreeSet<_> =
                     st.verdict_names(&old, v)?.into_iter().collect();
                 let b: std::collections::BTreeSet<_> =
                     st.verdict_names(&new, v)?.into_iter().collect();
-                let added: Vec<_> = b.difference(&a).collect();
-                let removed: Vec<_> = a.difference(&b).collect();
+                let (added, removed) = diff_names(&a, &b);
                 println!("{}: +{} -{}", v.as_str(), added.len(), removed.len());
-                for x in added {
+                for x in &added {
                     println!("  + {x}");
                 }
-                for x in removed {
+                for x in &removed {
                     println!("  - {x}");
                 }
             }
@@ -234,7 +253,7 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_since;
+    use super::{diff_names, parse_since};
 
     #[test]
     fn since_units() {
@@ -245,5 +264,43 @@ mod tests {
         assert_eq!(parse_since("45").unwrap(), 45);
         assert_eq!(parse_since("0d").unwrap(), 1);
         assert!(parse_since("10x").is_err());
+    }
+
+    #[test]
+    fn diff_names_reports_added_and_removed() {
+        let a: std::collections::BTreeSet<String> =
+            ["keep", "gone"].iter().map(|s| s.to_string()).collect();
+        let b: std::collections::BTreeSet<String> =
+            ["keep", "new"].iter().map(|s| s.to_string()).collect();
+        let (added, removed) = diff_names(&a, &b);
+        assert_eq!(added, vec!["new".to_string()]);
+        assert_eq!(removed, vec!["gone".to_string()]);
+    }
+
+    #[test]
+    fn json_output_shape_has_key_fields() {
+        // --json 输出的最小形状：verdict 小写、package.name 保留
+        let mut p = orphan_audit_core::model::Package::new(
+            "dusty",
+            orphan_audit_core::model::Manager::Cargo,
+        );
+        p.binaries = vec!["dusty".into()];
+        let r = orphan_audit_core::model::VerdictResult {
+            package: p,
+            verdict: orphan_audit_core::model::Verdict::Unused,
+            interactive_hits: 0,
+            last_exec_days_ago: None,
+            in_shell_config: false,
+            newly_installed: false,
+            evidence: vec![],
+        };
+        let v: serde_json::Value = serde_json::to_value(vec![r]).unwrap();
+        assert_eq!(
+            v[0]["package"]["name"].as_str(),
+            Some("dusty"),
+            "package.name must serialize"
+        );
+        assert_eq!(v[0]["verdict"].as_str(), Some("unused"));
+        assert_eq!(v[0]["interactive_hits"].as_u64(), Some(0));
     }
 }
