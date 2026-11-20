@@ -58,8 +58,13 @@ etw-capture/            独立 workspace（同 gui/ 模式：重型 windows 依�
   - `uninstall`：先停 ETW 会话再删任务；运行中的采集进程随会话停止自行退出
     （事件线程返回即触发停机标志）。
   - `status`：查询任务是否注册 / 采集进程是否在跑 / 日志路径、大小与修改时间。
-  - **已知取舍**：控制台程序随任务启动会显示一个控制台窗口（最小化即可，不影响采集）。
-    完全无窗需要 Windows 服务或隐藏宿主包装，不在本期。
+  - **窗口形态**（2026-11-20）：release 构建为 **GUI 子系统**（crate 根
+    `#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]`，
+    debug 保持控制台子系统，`cargo run` 开发体验不变）——计划任务/登录拉起**不再弹
+    控制台窗口**。交互输出经 `attach_console_if_available` 衔接：AttachConsole 挂父
+    控制台 + 重定向 std 句柄（终端里跑 install/status/deep 输出照常可见；管道/无控制台
+    场景静默跳过，Rust std 对空句柄写入是静默丢弃不 panic）。守护侧诊断（会话启停、
+    轮转、4688 标志自愈、追加失败）落 `<数据目录>/etw/capture.log`（每行时间戳）。
 - **日志治理**：常驻采集下日志无限增长，两端配合治理——采集端启动时超过 64MB 轮转为
   `events.jsonl.1`（覆盖旧轮转档）；消费端 `core::etw::read_etw_log_since` 只读
   `--since` 窗口内事件（审计主流程传 since-1 天），窗口外事件不进判定。
@@ -69,6 +74,41 @@ etw-capture/            独立 workspace（同 gui/ 模式：重型 windows 依�
 
 - 非管理员启动：立即报错退出（明确提示），不静默。
 - 会话名固定 `orphan-audit-etw`；异常退出后残留会话由下次启动时先停后建（幂等）。
+- deep 模式用独立会话名 `orphan-audit-deep`（与常驻采集互不影响）；强杀进程会遗留
+  该会话，下次 `deep` 启动时先停后建（幂等）。
+
+## 4688 命令行并入（2026-11-19）
+
+Kernel-Process 只给进程名，命令行是归因的关键（`pip uninstall numpy` 与
+`python -m numpy` 的区分全靠它）。常驻采集另起一线程轮询 Security 日志：
+
+- **启用链**（install 时执行，幂等、失败仅告警）：`auditpol /set` 用子类别 **GUID**
+  `{0CCE922B-69AE-11D9-BED3-505054503030}` 引用「进程创建」——中文系统不认英文名
+  "Process Creation"（实测）；`reg add` 置 `ProcessCreationIncludeCmdLine_Enabled=1`。
+  该注册表值在本机实测会被环境（安全软件/域策略）数分钟内回写删除，事件命令行变空
+  时先查它。
+- **采集**：每 5 秒 `wevtutil qe Security`（2 分钟重叠窗口 + EventRecordID 断点续传，
+  状态存 `events.jsonl.4688.state`，单轮上限 `/c:2000`）。直启 wevtutil 不经 cmd /c
+  包装——Rust 参数拼接的 `\"` 转义 cmd 不认，会把含空格的 XPath 拆参（实测 rc=87）；
+  `/uni:true` 强制 UTF-16LE 输出，绕开重定向下控制台代码页（中文系统 GBK）的乱码。
+  落盘时间戳用**事件自带 SystemTime**（2026-11-20 起，`append_etw_event_at`），不是
+  轮询时刻——轮询延迟不得推后事件时间（消费端按 ts 过滤判定窗口）。
+- **只写解释器**（node.exe / python.exe / pythonw.exe）：其余进程 Kernel-Process 已
+  覆盖，避免双计；命令行进 `cmd` 字段，归因由消费端完成。
+
+## deep 深度模式（opt-in spike，2026-11-19）
+
+`etw-capture.exe deep` 前台运行：订阅 FILE_IO_INIT（Create/Cleanup/Close 带路径），
+把 site-packages / node_modules 下的文件打开归因为包使用，写入 import 事件日志。
+实测要点（Win11 26100 / ferrisetw 1.2）：
+
+- 路径属性在 Create（opcode 64）事件里叫 **OpenPath** 而非 FileName；Cleanup/Close/
+  QueryInfo 的属性表没有路径——只处理 Create，其余丢弃。
+- 内核文件事件是洪流：一次 import 触发同包上百次打开（实测 11 秒 6500 行）。每包
+  每进程只记一次 + 过滤非包段（`.dist-info` / `.egg-info` / `__pycache__` / `.pth` /
+  `.IPGSD` TSD 隔离副本）后压到 24 行/11 秒。
+- `.dist-info` 必须过滤：pip 装卸与元数据扫描也会打开它们，不能算使用。
+- CPU 代价可感知（每文件打开都进用户态回调），只作前台手动短时验证，不进常驻。
 
 ## 验证（对应审计 S17 完成判据，2026-11-18 实测通过）
 

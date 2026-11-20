@@ -3,14 +3,22 @@ name: CI
 on:
   push:
     branches: [main]
+    # 两种 tag 惯例都认：v0.3.0 / 0.3.0（项目实际用无 v 前缀形态）
+    tags: ["v*", "*.*.*"]
   pull_request:
+
+# 同分支新 push 取消旧跑；tag 构建不取消（发布产物不能被中途打断）
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   test:
-    # Windows 优先（ETW/atime/PSReadLine 均为 Windows 信号源）
+    # Windows 优先（ETW/atime/PSReadLine 均为 Windows 信号源）；
+    # 步骤与本地门禁基线逐字同构（AGENTS.md「怎么跑」），不给 CI 开小灶
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,3 +50,54 @@ jobs:
       - name: Clippy (etw-capture)
         working-directory: etw-capture
         run: cargo clippy --all-targets -- -D warnings
+      # release 配置单独 clippy + 构建：GUI 子系统 / AttachConsole 代码只在
+      # release 编译（R8 实录：GENERIC_WRITE 在 windows-sys 0.61 换了模块，
+      # debug 门禁全绿、首次 release 构建才炸——CI 必须编到这条路径）
+      - name: Clippy (etw-capture, release)
+        working-directory: etw-capture
+        run: cargo clippy --release -- -D warnings
+      - name: Build (etw-capture, release)
+        working-directory: etw-capture
+        run: cargo build --release
+
+  # advisory：core/cli 的 Unix 分支（cfg(not(windows)) 回退路径）从未在任何
+  # 平台验证过编译——本地交叉实验卡在 libsqlite3-sys 的 C 交叉工具链，
+  # 代码层结论未知。只 check/clippy 不跑测试（多数测试断言 Windows 布局）。
+  # 不阻塞合并；转正条件：连续绿后去掉 continue-on-error
+  unix-check:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check (root workspace, unix paths)
+        run: cargo check --workspace --all-targets
+      - name: Clippy (root workspace, unix paths)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # tag 触发（v* 或 0.3.0 式裸版本号）：三 workspace release 构建 + artifact 上传。
+  # 只上传 artifact，不自动建 GitHub Release——发布节奏由维护者拍板
+  release-artifacts:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binaries
+        run: |
+          cargo build --release
+          cargo build --release --manifest-path etw-capture/Cargo.toml
+          cargo build --release --manifest-path gui/Cargo.toml
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: orphan-audit-${{ github.ref_name }}
+          path: |
+            target/release/orphan-audit.exe
+            etw-capture/target/release/orphan-audit-etw-capture.exe
+            gui/target/release/orphan-audit-gui.exe
+          if-no-files-found: error

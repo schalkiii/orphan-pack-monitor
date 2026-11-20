@@ -80,12 +80,15 @@ pub fn read_etw_log_since(
     Ok(events)
 }
 
-/// 把一条进程事件追加为 JSONL（守护进程侧使用）。
-pub fn append_etw_event(
+/// 把一条进程事件以指定时间戳追加为 JSONL（守护进程侧使用）。
+/// 4688 轮询路径必须传事件自带的 SystemTime：轮询周期 + 重叠窗 + 停机续传
+/// 的延迟不该推后事件时间——ts 直接参与判定窗口过滤与 last_seen 展示。
+pub fn append_etw_event_at(
     path: &Path,
     binary: &str,
     parent: Option<&str>,
     cmd: Option<&str>,
+    ts: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     use std::io::Write;
     if let Some(parent_dir) = path.parent() {
@@ -93,7 +96,7 @@ pub fn append_etw_event(
     }
     let rec = serde_json::json!({
         "binary": binary,
-        "ts": Utc::now().to_rfc3339(),
+        "ts": ts.to_rfc3339(),
         "parent": parent,
         "cmd": cmd,
     });
@@ -105,6 +108,16 @@ pub fn append_etw_event(
     Ok(())
 }
 
+/// 把一条进程事件以当前时间追加（实时事件：Kernel-Process 回调）。
+pub fn append_etw_event(
+    path: &Path,
+    binary: &str,
+    parent: Option<&str>,
+    cmd: Option<&str>,
+) -> anyhow::Result<()> {
+    append_etw_event_at(path, binary, parent, cmd, Utc::now())
+}
+
 /// 默认 ETW 事件日志路径：数据目录下 etw/events.jsonl。
 pub fn default_log_path() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join("orphan-audit").join("etw").join("events.jsonl"))
@@ -113,7 +126,7 @@ pub fn default_log_path() -> Option<PathBuf> {
 /// 检查当前进程是否具备管理员权限（ETW 内核 provider 的前提）。
 #[cfg(windows)]
 pub fn is_elevated() -> bool {
-    // 通过 fsutil 这种需要管理员的只读命令间接判断，避免引入 windows-sys 复杂 FFI
+    // net session 需要管理员权限，用一个只读系统命令间接探测提权，避免引入 windows-sys 复杂 FFI
     use std::os::windows::process::CommandExt;
     use std::process::Command;
     let mut c = Command::new("net");
@@ -164,6 +177,20 @@ mod tests {
         assert_eq!(events[0].binary, "rg");
         assert_eq!(events[0].source, SignalSource::Etw);
         assert_eq!(events[0].parent.as_deref(), Some("pwsh.exe"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn append_etw_event_at_preserves_explicit_timestamp() {
+        let dir = std::env::temp_dir().join(format!("oa_etw_at_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("events.jsonl");
+        let fixed: DateTime<Utc> = "2026-01-02T03:04:05.1234567+00:00".parse().unwrap();
+        append_etw_event_at(&p, "node", Some("pwsh.exe"), None, fixed).unwrap();
+        let evs = read_etw_log(&p).unwrap();
+        assert_eq!(evs.len(), 1);
+        // 落盘回读的时间戳与传入值一致（4688 事件时间不失真）
+        assert_eq!(evs[0].timestamp, fixed);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

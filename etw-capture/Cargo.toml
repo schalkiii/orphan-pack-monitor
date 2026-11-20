@@ -1,6 +1,6 @@
 [package]
 name = "orphan-audit-etw-capture"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -11,5 +11,14 @@ orphan-audit-core = { path = "../crates/core" }
 ferrisetw = "1.2"
 anyhow = "1"
 ctrlc = "3"
+chrono = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+] }
 
 [workspace]

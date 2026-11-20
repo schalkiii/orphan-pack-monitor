@@ -1,6 +1,6 @@
 [package]
 name = "orphan-audit-gui"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "GPUI desktop GUI for orphan-audit"
 
@@ -8,5 +8,8 @@ description = "GPUI desktop GUI for orphan-audit"
 gpui = { package = "gpui-pre", version = "=0.3.12", default-features = false, features = ["windows-manifest"] }
 gpui-pre-platform = "=0.3.12"
 orphan-audit-core = { path = "../crates/core" }
+
+[build-dependencies]
+winresource = "0.1"
 
 [workspace]

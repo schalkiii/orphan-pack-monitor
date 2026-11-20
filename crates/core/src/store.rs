@@ -10,6 +10,16 @@ pub struct Store {
     conn: Connection,
 }
 
+/// 一档的快照对比结果（drift_diff 返回）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DriftDiff {
+    pub verdict: Verdict,
+    /// 新快照有、旧快照没有（新增）。
+    pub added: Vec<String>,
+    /// 旧快照有、新快照没有（移除）。
+    pub removed: Vec<String>,
+}
+
 impl Store {
     /// 打开（或创建）数据库。使用 bundled SQLite，无需系统库。
     pub fn open(path: &std::path::Path) -> Result<Self> {
@@ -45,7 +55,8 @@ impl Store {
                 size_bytes INTEGER,
                 confidence TEXT NOT NULL,
                 is_dependency INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (name, manager)
+                install_key TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (name, manager, install_key)
             );
             CREATE TABLE IF NOT EXISTS usage_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,17 +73,87 @@ impl Store {
                 snapshot_id TEXT NOT NULL,
                 name TEXT NOT NULL,
                 manager TEXT NOT NULL,
+                install_key TEXT NOT NULL DEFAULT '',
                 verdict TEXT NOT NULL,
                 interactive_hits INTEGER NOT NULL,
                 last_exec_days_ago INTEGER,
                 in_shell_config INTEGER NOT NULL,
                 evidence TEXT NOT NULL,
                 computed_at TEXT NOT NULL,
-                PRIMARY KEY (snapshot_id, name, manager)
+                PRIMARY KEY (snapshot_id, name, manager, install_key)
             );
             "#,
         )?;
+        self.migrate_legacy_multi_install()?;
         Ok(())
+    }
+
+    /// 0.2.0 及更早的库以 (name, manager) / (snapshot_id, name, manager) 为主键——
+    /// 多 prefix / 多 python 环境检测上线后，同名包可合法存在多份（实测
+    /// @jackwener/opencli 同时装在默认 prefix 与 QClaw prefix），旧主键下第二条
+    /// INSERT 即违反 UNIQUE、整个 replace_inventory 事务回滚。检测到旧 schema
+    /// （packages 表无 install_key 列）时重建两表；历史 verdicts 无路径信息，
+    /// install_key 统一置 ''（streak 查询不按 install_key 匹配，混用无害）。
+    fn migrate_legacy_multi_install(&self) -> Result<()> {
+        if self.has_column("packages", "install_key")? {
+            return Ok(()); // 已是新 schema（packages 与 verdicts 同批迁移）
+        }
+        self.conn.execute_batch(
+            r#"
+            BEGIN;
+            CREATE TABLE packages_new (
+                name TEXT NOT NULL,
+                manager TEXT NOT NULL,
+                version TEXT,
+                binaries TEXT NOT NULL,
+                install_path TEXT,
+                installed_at TEXT,
+                size_bytes INTEGER,
+                confidence TEXT NOT NULL,
+                is_dependency INTEGER NOT NULL DEFAULT 0,
+                install_key TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (name, manager, install_key)
+            );
+            INSERT INTO packages_new
+                SELECT name, manager, version, binaries, install_path, installed_at,
+                       size_bytes, confidence, is_dependency, IFNULL(install_path, '')
+                FROM packages;
+            DROP TABLE packages;
+            ALTER TABLE packages_new RENAME TO packages;
+
+            CREATE TABLE verdicts_new (
+                snapshot_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                manager TEXT NOT NULL,
+                install_key TEXT NOT NULL DEFAULT '',
+                verdict TEXT NOT NULL,
+                interactive_hits INTEGER NOT NULL,
+                last_exec_days_ago INTEGER,
+                in_shell_config INTEGER NOT NULL,
+                evidence TEXT NOT NULL,
+                computed_at TEXT NOT NULL,
+                PRIMARY KEY (snapshot_id, name, manager, install_key)
+            );
+            INSERT INTO verdicts_new
+                SELECT snapshot_id, name, manager, '', verdict, interactive_hits,
+                       last_exec_days_ago, in_shell_config, evidence, computed_at
+                FROM verdicts;
+            DROP TABLE verdicts;
+            ALTER TABLE verdicts_new RENAME TO verdicts;
+            COMMIT;
+            "#,
+        )?;
+        Ok(())
+    }
+
+    /// `table` 是否已有 `column` 列（schema 版本探测）。
+    fn has_column(&self, table: &str, column: &str) -> Result<bool> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let names: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .flatten()
+            .collect();
+        Ok(names.iter().any(|c| c.as_str() == column))
     }
 
     /// 用一次审计结果替换 packages / usage_events 表（全量刷新）。
@@ -84,8 +165,8 @@ impl Store {
             let mut stmt = tx.prepare(
                 r#"INSERT INTO packages
                    (name, manager, version, binaries, install_path, installed_at,
-                    size_bytes, confidence, is_dependency)
-                   VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"#,
+                    size_bytes, confidence, is_dependency, install_key)
+                   VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)"#,
             )?;
             for p in packages {
                 stmt.execute(params![
@@ -100,6 +181,7 @@ impl Store {
                     p.size_bytes.map(|x| x as i64),
                     conf_str(p.confidence),
                     p.is_dependency as i32,
+                    install_key(p),
                 ])?;
             }
         }
@@ -131,15 +213,16 @@ impl Store {
         {
             let mut stmt = tx.prepare(
                 r#"INSERT OR REPLACE INTO verdicts
-                   (snapshot_id, name, manager, verdict, interactive_hits,
+                   (snapshot_id, name, manager, install_key, verdict, interactive_hits,
                     last_exec_days_ago, in_shell_config, evidence, computed_at)
-                   VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"#,
+                   VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)"#,
             )?;
             for r in results {
                 stmt.execute(params![
                     snapshot_id,
                     r.package.name,
                     r.package.manager.as_str(),
+                    install_key(&r.package),
                     r.verdict.as_str(),
                     r.interactive_hits as i64,
                     r.last_exec_days_ago.map(|x| x as i64),
@@ -175,9 +258,31 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// 某包在 exclude_snapshot 之前**连续**判 unused 的快照数（漂移即信号：
+    /// 快照漂移对比（CLI drift 子命令与 GUI「长期对比」面板共用同一实现，
+    /// 保证两侧结果一字不差）。只对比 active/unused 两档——中间档随窗口参数
+    /// 波动，列入会淹没真实增删（与 CLI 帮助文案同一理由）。
+    pub fn drift_diff(&self, old: &str, new: &str) -> Result<Vec<DriftDiff>> {
+        let mut out = Vec::new();
+        for verdict in [Verdict::Active, Verdict::Unused] {
+            let a: std::collections::BTreeSet<String> =
+                self.verdict_names(old, verdict)?.into_iter().collect();
+            let b: std::collections::BTreeSet<String> =
+                self.verdict_names(new, verdict)?.into_iter().collect();
+            out.push(DriftDiff {
+                verdict,
+                added: b.difference(&a).cloned().collect(),
+                removed: a.difference(&b).cloned().collect(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// 某包在 exclude_snapshot 之前**连续**判 unused 的**月**数（漂移即信号：
     /// 连续多月 unused 比单月 unused 更接近可删；快照 ID 为 YYYY-MM 字符串，
     /// 字典序即时间序，只统计严格更早的快照，从最新往回数到首个非 unused 为止）。
+    /// GROUP BY snapshot_id：同名包多实例（多 prefix / 多环境）时按月计数不按行，
+    /// 且每月取 MIN(verdict)（字母序最小 = 使用最强的档）——任一副本在用即断档，
+    /// 保守语义防止把「一处还在用」的包误标为长期没人用。单副本数据行为不变。
     pub fn unused_streak_months(
         &self,
         name: &str,
@@ -185,8 +290,9 @@ impl Store {
         exclude_snapshot: &str,
     ) -> Result<u32> {
         let mut stmt = self.conn.prepare(
-            "SELECT verdict FROM verdicts
+            "SELECT MIN(verdict) FROM verdicts
              WHERE name=?1 AND manager=?2 AND snapshot_id<?3
+             GROUP BY snapshot_id
              ORDER BY snapshot_id DESC",
         )?;
         let rows = stmt.query_map(params![name, manager, exclude_snapshot], |r| {
@@ -271,6 +377,16 @@ impl Store {
     }
 }
 
+/// 同名包多实例的判别键：多 prefix / 多 python 环境下 (name, manager) 不再唯一
+/// （同一包可装在默认 prefix 与 QClaw prefix 两处），install_path 的字符串形式
+/// 作为主键组成部分；采集器未提供路径的包统一空串。
+fn install_key(p: &Package) -> String {
+    p.install_path
+        .as_ref()
+        .map(|x| x.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 /// 存储层的事件行（与 model::UsageEvent 分开，避免持久化结构污染领域模型）。
 #[derive(Debug, Clone)]
 pub struct UsageEventRow {
@@ -336,6 +452,7 @@ fn parse_source(s: &str) -> Option<SignalSource> {
     match s {
         "history" => Some(SignalSource::History),
         "etw" => Some(SignalSource::Etw),
+        "import" => Some(SignalSource::Import),
         "atime" => Some(SignalSource::Atime),
         "shell-config" => Some(SignalSource::ShellConfig),
         "alias" => Some(SignalSource::Alias),
@@ -383,6 +500,55 @@ mod tests {
             .is_empty());
         assert_eq!(store.snapshot_ids().unwrap(), vec!["2026-11", "2026-12"]);
         assert_eq!(store.packages().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn drift_diff_reports_added_removed_and_skips_middle_tiers() {
+        let store = Store::in_memory().unwrap();
+        let mk = |name: &str, v: Verdict| {
+            let mut p = Package::new(name, Manager::Cargo);
+            p.binaries = vec![name.to_string()];
+            VerdictResult {
+                package: p,
+                verdict: v,
+                interactive_hits: 0,
+                last_exec_days_ago: None,
+                in_shell_config: false,
+                newly_installed: false,
+                evidence: vec![],
+            }
+        };
+        // 旧快照：dusty active、ghost unused、middle rare
+        store
+            .save_snapshot(
+                "2026-11",
+                &[
+                    mk("dusty", Verdict::Active),
+                    mk("ghost", Verdict::Unused),
+                    mk("middle", Verdict::Rare),
+                ],
+            )
+            .unwrap();
+        // 新快照：dusty 降档（removed@active + added@unused）、ghost 卸载、
+        // fresh 新装；middle 换成另一中间档——两档都不得出现在对比里
+        store
+            .save_snapshot(
+                "2026-12",
+                &[
+                    mk("dusty", Verdict::Unused),
+                    mk("fresh", Verdict::Unused),
+                    mk("middle", Verdict::Integration),
+                ],
+            )
+            .unwrap();
+        let diffs = store.drift_diff("2026-11", "2026-12").unwrap();
+        assert_eq!(diffs.len(), 2, "只对比 active/unused 两档");
+        assert_eq!(diffs[0].verdict, Verdict::Active);
+        assert!(diffs[0].added.is_empty());
+        assert_eq!(diffs[0].removed, vec!["dusty"]);
+        assert_eq!(diffs[1].verdict, Verdict::Unused);
+        assert_eq!(diffs[1].added, vec!["dusty", "fresh"]);
+        assert_eq!(diffs[1].removed, vec!["ghost"]);
     }
 
     #[test]
@@ -460,5 +626,151 @@ mod tests {
         assert_eq!(events[0].source, SignalSource::History);
         assert_eq!(events[0].count, 5);
         assert_eq!(events[0].command_line.as_deref(), Some("dusty run"));
+    }
+
+    #[test]
+    fn duplicate_packages_across_prefixes_persist() {
+        // 多 prefix 下同名包两份（不同 install_path，实测 @jackwener/opencli 布局）：
+        // 旧主键 (name, manager) 下第二条 INSERT 违反 UNIQUE、整个事务回滚
+        let store = Store::in_memory().unwrap();
+        let mk = |path: &str| {
+            let mut p = Package::new("@scope/tool", Manager::Npm);
+            p.binaries = vec!["tool".into()];
+            p.install_path = Some(std::path::PathBuf::from(path));
+            p
+        };
+        store
+            .replace_inventory(
+                &[
+                    mk(r"C:\npm\node_modules\@scope\tool"),
+                    mk(r"C:\qclaw\npm-global\node_modules\@scope\tool"),
+                ],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(store.packages().unwrap().len(), 2);
+        // 路径均缺失的同名包两份（install_key 同为 ''）仍冲突：采集器保证
+        // 同包目录唯一，此形态不应出现；断言固化该边界语义
+        let mut no_path = Package::new("x", Manager::Pip);
+        no_path.binaries = vec!["x".into()];
+        assert!(store
+            .replace_inventory(&[no_path.clone(), no_path], &[])
+            .is_err());
+    }
+
+    #[test]
+    fn snapshot_keeps_instances_and_streak_counts_months() {
+        let store = Store::in_memory().unwrap();
+        let mk = |path: &str, v: Verdict| {
+            let mut p = Package::new("tool", Manager::Npm);
+            p.install_path = Some(std::path::PathBuf::from(path));
+            VerdictResult {
+                package: p,
+                verdict: v,
+                interactive_hits: 0,
+                last_exec_days_ago: None,
+                in_shell_config: false,
+                newly_installed: false,
+                evidence: vec![],
+            }
+        };
+        // 2026-06：两份副本均 unused
+        store
+            .save_snapshot(
+                "2026-06",
+                &[mk(r"C:\a", Verdict::Unused), mk(r"C:\b", Verdict::Unused)],
+            )
+            .unwrap();
+        // 两份副本都保留（旧主键 INSERT OR REPLACE 会静默合并成一份）
+        assert_eq!(
+            store
+                .verdict_names("2026-06", Verdict::Unused)
+                .unwrap()
+                .len(),
+            2
+        );
+        // 2026-07：一份 active 一份 unused → 该月 MIN=active，streak 断档
+        store
+            .save_snapshot(
+                "2026-07",
+                &[mk(r"C:\a", Verdict::Active), mk(r"C:\b", Verdict::Unused)],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .unused_streak_months("tool", "npm", "2026-08")
+                .unwrap(),
+            0
+        );
+        // 07 重写为全 unused → 两个月均计入（按月不按行：2 而非 4）
+        store
+            .save_snapshot(
+                "2026-07",
+                &[mk(r"C:\a", Verdict::Unused), mk(r"C:\b", Verdict::Unused)],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .unused_streak_months("tool", "npm", "2026-08")
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn legacy_schema_migrates_with_data() {
+        let dir = std::env::temp_dir().join(format!("oa_mig_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("legacy.db");
+        {
+            // 手工构造 0.2.0 及更早的 schema（无 install_key 列）+ 一行真实数据
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE packages (
+                    name TEXT NOT NULL, manager TEXT NOT NULL, version TEXT,
+                    binaries TEXT NOT NULL, install_path TEXT, installed_at TEXT,
+                    size_bytes INTEGER, confidence TEXT NOT NULL,
+                    is_dependency INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (name, manager)
+                );
+                CREATE TABLE verdicts (
+                    snapshot_id TEXT NOT NULL, name TEXT NOT NULL, manager TEXT NOT NULL,
+                    verdict TEXT NOT NULL, interactive_hits INTEGER NOT NULL,
+                    last_exec_days_ago INTEGER, in_shell_config INTEGER NOT NULL,
+                    evidence TEXT NOT NULL, computed_at TEXT NOT NULL,
+                    PRIMARY KEY (snapshot_id, name, manager)
+                );
+                INSERT INTO packages VALUES
+                    ('dusty','cargo','0.1','["dusty"]','C:\b','2026-01-01T00:00:00+00:00',NULL,'exact',0);
+                INSERT INTO verdicts VALUES
+                    ('2026-01','dusty','cargo','unused',0,NULL,0,'[]','2026-01-01T00:00:00+00:00');
+                "#,
+            )
+            .unwrap();
+        }
+        // 打开即迁移：数据保留、快照可读
+        let store = Store::open(&db).unwrap();
+        let pkgs = store.packages().unwrap();
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].name, "dusty");
+        assert_eq!(
+            pkgs[0].install_path.as_deref(),
+            Some(std::path::Path::new(r"C:\b"))
+        );
+        assert_eq!(
+            store.verdict_names("2026-01", Verdict::Unused).unwrap(),
+            vec!["dusty"]
+        );
+        // 迁移后可写入旧主键下会冲突的多实例
+        let mut a = Package::new("tool", Manager::Npm);
+        a.install_path = Some(std::path::PathBuf::from(r"C:\a"));
+        let mut b = Package::new("tool", Manager::Npm);
+        b.install_path = Some(std::path::PathBuf::from(r"C:\b"));
+        store.replace_inventory(&[a, b], &[]).unwrap();
+        assert_eq!(store.packages().unwrap().len(), 2);
+        drop(store); // 释放 SQLite 连接后才能删目录（Windows WAL 占用）
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

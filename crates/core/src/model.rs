@@ -40,10 +40,13 @@ impl Manager {
     /// 该管理器安装的二进制目录是否可直接枚举（决定二进制映射置信度）。
     pub fn binary_mapping_confidence(&self) -> Confidence {
         match self {
-            // cargo/npm/uv/pipx 都能从清单或 package.json 精确读出 bin 名
-            Manager::Cargo | Manager::Npm | Manager::Uv | Manager::Pipx => Confidence::Exact,
+            // cargo/npm/uv/pipx 都能从清单或 package.json 精确读出 bin 名；
+            // winget 便携包经 WinGet\Links 符号链接精确还原（见 collect_winget）
+            Manager::Cargo | Manager::Npm | Manager::Uv | Manager::Pipx | Manager::Winget => {
+                Confidence::Exact
+            }
             // pip 的 CLI 需从 entry_points / Scripts 目录推断
-            Manager::Pip | Manager::Scoop | Manager::Winget | Manager::Brew => Confidence::Inferred,
+            Manager::Pip | Manager::Scoop | Manager::Brew => Confidence::Inferred,
             // go install 不保留包清单，每个二进制自成一条
             Manager::Go => Confidence::None,
         }
@@ -105,9 +108,14 @@ impl Package {
     }
 
     /// 判断一个命令名是否属于本包。
+    /// 大小写不敏感：Windows 命令名不区分大小写，ETW 的 binary 名与历史里
+    /// 用户敲法的大小写不可控（`rg`/`RG`、`code`/`Code` 必须同判）。
     pub fn owns_binary(&self, command: &str) -> bool {
-        let command = basename(command);
-        self.binaries.iter().any(|b| basename(b) == command) || basename(&self.name) == command
+        let command = basename(command).to_ascii_lowercase();
+        self.binaries
+            .iter()
+            .any(|b| basename(b).to_ascii_lowercase() == command)
+            || basename(&self.name).to_ascii_lowercase() == command
     }
 }
 
@@ -128,6 +136,10 @@ pub enum SignalSource {
     Alias,
     /// 命令行里被 wrapper（sudo/env/xargs）包裹后还原出的真实命令。
     Wrapped,
+    /// import 钩子：python .pth / node NODE_OPTIONS 钩子直接记录的模块加载事件。
+    /// 与 ETW 互补——ETW 只见进程级（python.exe 无法归因到包），import 钩子
+    /// 天然按包归因且带时间戳，覆盖 IDE / agent / 项目脚本的一切 import 使用。
+    Import,
     /// 历史快照漂移：连续多个月快照均判 unused（长期未用的横向证据，
     /// 不出现在 UsageEvent 里，只用于证据链富化）。
     Drift,
@@ -138,6 +150,7 @@ impl SignalSource {
         match self {
             SignalSource::History => "history",
             SignalSource::Etw => "etw",
+            SignalSource::Import => "import",
             SignalSource::Atime => "atime",
             SignalSource::ShellConfig => "shell-config",
             SignalSource::Alias => "alias",
@@ -182,9 +195,12 @@ impl UsageEvent {
         matches!(self.source, SignalSource::History | SignalSource::Wrapped)
     }
 
-    /// 是否为系统级执行证据（含 ETW 与 atime）。
+    /// 是否为系统级执行证据（含 ETW / import 钩子与 atime）。
     pub fn is_execution(&self) -> bool {
-        matches!(self.source, SignalSource::Etw | SignalSource::Atime)
+        matches!(
+            self.source,
+            SignalSource::Etw | SignalSource::Import | SignalSource::Atime
+        )
     }
 }
 
@@ -200,7 +216,7 @@ pub enum Verdict {
     Rare = 2,
     /// 从未执行，但被 shell 配置 / alias 引用。
     Integration = 3,
-    /// 五路信号全静默，唯一进入清理候选的档位。
+    /// 所有信号全静默，唯一进入清理候选的档位。
     Unused = 4,
 }
 
@@ -317,6 +333,53 @@ pub fn basename(s: &str) -> &str {
     s.rsplit(['/', '\\']).next().unwrap_or(s)
 }
 
+/// npm 卸载残骸：包已不在 node_modules，prefix 根的启动器三件套仍在。
+/// npm uninstall 半途失败（本机实测为安全代理干扰）会留下这类死文件——
+/// 它们躺在 PATH 目录上，敲命令会撞上死启动器，且不属于任何包、
+/// 不进五档判定，只能由残骸检测单独发现并给出清理建议。
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrphanShim {
+    /// 所在 npm 全局 prefix（残骸文件所在目录）。
+    pub prefix: PathBuf,
+    /// 命令名（启动器 stem，去掉 .cmd/.ps1 后缀）。
+    pub bin: String,
+    /// 残骸文件全集：`<bin>` / `<bin>.cmd` / `<bin>.ps1` 及其 .IPGSD
+    /// 隔离副本中实际存在者（只登记路径，绝不读取内容）。
+    pub files: Vec<PathBuf>,
+}
+
+/// 多环境检测到的一处环境：npm 全局 prefix（多 node 环境）或 python 解释器。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedEnv {
+    pub kind: EnvKind,
+    pub path: PathBuf,
+}
+
+impl DetectedEnv {
+    /// CLI / 文本报告的单行标签（形如 `npm prefix: C:\...\npm`）。
+    pub fn label(&self) -> String {
+        format!("{}: {}", self.kind.as_str(), self.path.display())
+    }
+}
+
+/// 环境种类（多环境检测）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvKind {
+    /// npm 全局 prefix（每个 node 环境一份独立的 node_modules）。
+    NpmPrefix,
+    /// python 解释器（系统 / 用户 / conda / uv 托管 / 自定义注册）。
+    Python,
+}
+
+impl EnvKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EnvKind::NpmPrefix => "npm prefix",
+            EnvKind::Python => "python",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,6 +411,23 @@ mod tests {
     }
 
     #[test]
+    fn package_owns_binary_is_case_insensitive() {
+        // Windows 命令名不区分大小写：ETW 上报与用户敲法的大小写不可控，
+        // `RG`/`rg`、`Code`/`code` 必须同判（漏配 = 误判可删，最危险方向）
+        let mut p = Package::new("Firecrawl-CLI", Manager::Npm);
+        p.binaries.push("firecrawl-cli".into());
+        assert!(!p.owns_binary("RG")); // 非本包
+        let mut q = Package::new("ripgrep", Manager::Cargo);
+        q.binaries.push("rg".into());
+        assert!(q.owns_binary("RG"));
+        assert!(q.owns_binary("Rg"));
+        assert!(q.owns_binary(r"C:\Tools\RG.exe".strip_suffix(".exe").unwrap()));
+        assert!(q.owns_binary("RIPGREP")); // 包名回退匹配也小写化
+        let v = Package::new("Code", Manager::Npm);
+        assert!(v.owns_binary("code"));
+    }
+
+    #[test]
     fn usage_event_interactive_vs_execution() {
         let now = Utc::now();
         let h = UsageEvent::new("rg", now, SignalSource::History);
@@ -358,5 +438,20 @@ mod tests {
         assert!(e.is_execution());
         let a = UsageEvent::new("rg", now, SignalSource::Atime);
         assert!(a.is_execution());
+    }
+
+    #[test]
+    fn detected_env_label_matches_cli_format() {
+        // CLI 文本输出格式（audit 尾部）固定为 "<kind>: <path>"
+        let npm = DetectedEnv {
+            kind: EnvKind::NpmPrefix,
+            path: PathBuf::from(r"C:\npm"),
+        };
+        assert_eq!(npm.label(), r"npm prefix: C:\npm");
+        let py = DetectedEnv {
+            kind: EnvKind::Python,
+            path: PathBuf::from(r"C:\Program Files\Python313\python.exe"),
+        };
+        assert_eq!(py.label(), r"python: C:\Program Files\Python313\python.exe");
     }
 }

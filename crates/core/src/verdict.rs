@@ -4,7 +4,7 @@
 //! 1. 规则顺序就是正确性。active -> indirect -> rare -> integration -> unused，
 //!    每一条规则的存在都是为了把包从错误的 unused 中「救出来」。
 //!    重排规则会立刻开始产生误报。
-//! 2. 一个包只有在五路信号全部静默时才能判 unused。
+//! 2. 一个包只有在所有信号全部静默时才能判 unused。
 //! 3. 每行判定必须携带证据，让用户可以反驳判定，而不是盲目相信。
 
 use crate::model::{
@@ -45,6 +45,7 @@ pub fn evaluate(
     let mut last_exec: Option<DateTime<Utc>> = None;
     let mut history_hits: u32 = 0;
     let mut etw_hits: u32 = 0;
+    let mut import_hits: u32 = 0;
     let mut atime_hit = false;
     let mut indirect_parent: Option<String> = None;
 
@@ -71,6 +72,17 @@ pub fn evaluate(
                     if !is_interactive_shell(parent) && indirect_parent.is_none() {
                         indirect_parent = Some(parent.clone());
                     }
+                }
+            }
+            SignalSource::Import => {
+                // 与 ETW 同为窗口内执行证据：import 即真实使用（模块被加载），
+                // 归因到包由采集层完成（钩子天然按包；cmdline 经路径/top_level 映射）
+                if !in_window(ev.timestamp) {
+                    continue;
+                }
+                import_hits += count;
+                if last_exec.is_none_or(|t| ev.timestamp > t) {
+                    last_exec = Some(ev.timestamp);
                 }
             }
             SignalSource::Atime => {
@@ -109,6 +121,13 @@ pub fn evaluate(
                 .with_hits(etw_hits),
         );
     }
+    if import_hits > 0 {
+        evidence.push(
+            Evidence::new(SignalSource::Import, format!("imported {import_hits}x"))
+                .with_last(last_exec)
+                .with_hits(import_hits),
+        );
+    }
     if atime_hit {
         evidence.push(
             Evidence::new(SignalSource::Atime, "binary access time touched").with_last(last_exec),
@@ -129,7 +148,12 @@ pub fn evaluate(
 
     // === 规则按优先级顺序判定，命中即停 ===
 
-    // 规则 1: active —— 交互次数足够多，毫无疑问
+    // 规则 1: active —— 交互次数足够多，毫无疑问。
+    // 计数是**全时段**历史（不按窗口过滤）：这是刻意的设计权衡——历史插值
+    // 时间戳有误差，用它过滤会把真在用的包误降到 rare（误入清理候选，
+    // 最危险方向）；宁可让「过去密集敲过、近期零使用」的包停留在 active
+    // （偏保守）。窗口内的「近期没跑」由规则 2/3 的执行证据与 GUI 的
+    // Last run 字段另行呈现。
     let verdict = if interactive_hits >= threshold {
         Verdict::Active
     }
@@ -146,7 +170,7 @@ pub fn evaluate(
     else if in_shell_config {
         Verdict::Integration
     }
-    // 规则 5: unused —— 五路信号全静默
+    // 规则 5: unused —— 所有信号全静默
     else {
         Verdict::Unused
     };
@@ -220,7 +244,9 @@ pub fn evaluate_all(
 }
 
 /// 是否为交互式 shell（这些父进程下的 ETW 事件算「可能是用户直接调用」）。
-fn is_interactive_shell(parent: &str) -> bool {
+/// pub(crate)：signals::discount_probe_bursts 用同一名单区分「用户快速连打」
+/// 与「自动化包装器批量探测」。
+pub(crate) fn is_interactive_shell(parent: &str) -> bool {
     let p = basename(parent).to_ascii_lowercase();
     matches!(
         p.as_str(),
@@ -411,6 +437,40 @@ mod tests {
         );
         assert_eq!(r.verdict, Verdict::Indirect);
         assert!(r.evidence.iter().any(|e| e.detail.contains("executed 1x")));
+    }
+
+    #[test]
+    fn recent_import_is_indirect_with_evidence() {
+        let now = fixed_now();
+        let mut ev = UsageEvent::new("PyMuPDF", now, SignalSource::Import);
+        ev.count = 3;
+        let r = evaluate(
+            &pkg("PyMuPDF", "fitz"),
+            &[ev],
+            &[],
+            &AuditConfig::default(),
+            1000,
+            now,
+        );
+        // import 是真实使用（模块被加载）——近期 import 即 indirect，证据带次数
+        assert_eq!(r.verdict, Verdict::Indirect);
+        assert!(r
+            .evidence
+            .iter()
+            .any(|e| e.source == SignalSource::Import && e.detail.contains("imported 3x")));
+
+        // 窗口外的旧 import 不构成近期执行证据
+        let old = now - chrono::Duration::days(90);
+        let ev_old = UsageEvent::new("PyMuPDF", old, SignalSource::Import);
+        let r_old = evaluate(
+            &pkg("PyMuPDF", "fitz"),
+            &[ev_old],
+            &[],
+            &AuditConfig::default(),
+            1000,
+            now,
+        );
+        assert_eq!(r_old.verdict, Verdict::Unused);
     }
 
     #[test]

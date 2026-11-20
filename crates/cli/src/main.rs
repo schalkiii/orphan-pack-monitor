@@ -1,10 +1,11 @@
-//! orphan-audit CLI —— 审计全局 CLI 工具的使用情况，找出长期未用的孤儿包。
+//! orphan-audit CLI —— 审计全局安装包的使用情况，找出长期未用的孤儿包。
 //! 主路线 B（最近调用追踪），辅助路线 A 由 core 的静态审计接口提供。
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use orphan_audit_core::hooks;
 use orphan_audit_core::model::Manager;
-use orphan_audit_core::{actions, audit, model::AuditConfig};
+use orphan_audit_core::{actions, audit_with_paths, model::AuditConfig};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -35,11 +36,12 @@ struct Cli {
     #[arg(long = "manager", global = true, value_enum)]
     managers: Vec<ManagerArg>,
 
-    /// 指定数据库路径
+    /// 指定数据库路径（audit/status/clean/drift 均生效）
     #[arg(long, global = true)]
     db: Option<PathBuf>,
 
-    /// JSON 输出
+    /// JSON 输出（audit/status 生效——drift 只输出文本；audit 的 stdout 只含
+    /// results，warnings 经 stderr 另行输出，ETW 降级状态不在 stdout JSON 中）
     #[arg(long, global = true)]
     json: bool,
 }
@@ -56,13 +58,27 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
-    /// 对比两次快照的漂移
+    /// 对比两次快照，列出新增与移除的包（只对比 active/unused 两档：
+    /// Rare 等中间档随窗口参数波动，列入会淹没真实增删）
     Drift {
         #[arg(default_value = "")]
         old: String,
         #[arg(default_value = "")]
         new: String,
     },
+    /// 管理使用钩子（python .pth / node NODE_OPTIONS，捕捉 import 级使用证据）
+    Hooks {
+        /// install / uninstall / status
+        #[arg(value_enum)]
+        action: HookAction,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum HookAction {
+    Install,
+    Uninstall,
+    Status,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -113,25 +129,63 @@ fn parse_since(s: &str) -> Result<u32> {
         (s.as_str(), 1) // 纯数字 -> 天
     };
     let n: u32 = num.parse()?;
-    Ok((n * multiplier).max(1))
+    // 乘法必须显式检查：溢出在 release 下回绕成小值，观察窗口静默失真
+    let days = n
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow::anyhow!("--since window too large: {s}"))?;
+    Ok(days.max(1))
 }
 
-fn default_db() -> PathBuf {
-    dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("orphan-audit")
-        .join("orphan-audit.db")
-}
-
-/// 快照漂移：返回（新增, 移除）包名集合。a=旧快照，b=新快照。
-fn diff_names(
-    a: &std::collections::BTreeSet<String>,
-    b: &std::collections::BTreeSet<String>,
-) -> (Vec<String>, Vec<String>) {
-    (
-        b.difference(a).cloned().collect(),
-        a.difference(b).cloned().collect(),
-    )
+/// `hooks status` 的文本渲染（数据来自 core `hooks::status_info`，与 GUI 面板
+/// 同一数据源）。日志状态三分支与审计警告同一语义（R14：缺失 ≠ 被隔离）。
+fn hooks_status() -> Result<()> {
+    let st = hooks::status_info();
+    let mut with_pth = 0usize;
+    for (interp, has) in &st.interpreters {
+        if *has {
+            with_pth += 1;
+        }
+        println!(
+            "  {:<50} {}",
+            interp.display(),
+            if *has { "hooked" } else { "not hooked" }
+        );
+    }
+    println!(
+        "python interpreters hooked : {with_pth}/{}",
+        st.interpreters.len()
+    );
+    println!(
+        "tool venvs hooked          : {}/{}",
+        st.tool_venvs.0, st.tool_venvs.1
+    );
+    println!(
+        "node NODE_OPTIONS          : {}",
+        if st.node_hooked {
+            "hooked"
+        } else {
+            "not hooked"
+        }
+    );
+    if let Some((log, state)) = &st.log {
+        match state {
+            hooks::ImportLogState::Present(n) => println!(
+                "import log                 : {} ({} bytes)",
+                log.display(),
+                n
+            ),
+            hooks::ImportLogState::Quarantined(shadow) => println!(
+                "import log                 : {} (quarantined by security software: {})",
+                log.display(),
+                shadow.display()
+            ),
+            hooks::ImportLogState::Missing => println!(
+                "import log                 : {} (not created yet)",
+                log.display()
+            ),
+        }
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -143,15 +197,32 @@ fn main() -> Result<()> {
         ignore: cli.ignore.clone(),
         managers: cli.managers.iter().map(|m| Manager::from(*m)).collect(),
     };
-    let db = cli.db.clone().unwrap_or_else(default_db);
+    let db = cli
+        .db
+        .clone()
+        .unwrap_or_else(orphan_audit_core::default_db_path);
 
     match cli.command.unwrap_or(Commands::Audit) {
+        Commands::Hooks { action } => match action {
+            HookAction::Install => println!("{}", hooks::install()?),
+            HookAction::Uninstall => println!("{}", hooks::uninstall()?),
+            HookAction::Status => hooks_status()?,
+        },
         Commands::Audit => {
-            let report = audit(&config)?;
+            let report = audit_with_paths(&config, &db)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&report.results)?);
+                // 机器消费方也要看到降级（R12/R13 的「证据源死亡必须显式」）：
+                // stdout 保持纯 results（help 文档化的形状，jq 可解析），
+                // warnings 走 stderr——与文本模式同一通道、同一内容
+                for w in &report.warnings {
+                    eprintln!("warning: {w}");
+                }
             } else {
-                print!("{}", actions::generate_report(&report.results, since_days));
+                print!(
+                    "{}",
+                    actions::generate_report(&report.results, &report.orphan_shims, since_days)
+                );
                 if !report.warnings.is_empty() {
                     eprintln!("\nWarnings:");
                     for w in &report.warnings {
@@ -173,10 +244,17 @@ fn main() -> Result<()> {
                         "unavailable (degraded)"
                     }
                 );
+                if !report.detected_envs.is_empty() {
+                    // 多环境检测：让用户看到审计覆盖了哪些 node prefix / python
+                    eprintln!("Detected environments:");
+                    for env in &report.detected_envs {
+                        eprintln!("  - {}", env.label());
+                    }
+                }
             }
         }
         Commands::Status => {
-            let report = audit(&config)?;
+            let report = audit_with_paths(&config, &db)?;
             let mut counts: std::collections::BTreeMap<&str, u32> =
                 std::collections::BTreeMap::new();
             for r in &report.results {
@@ -202,11 +280,14 @@ fn main() -> Result<()> {
             }
         }
         Commands::Clean { output } => {
-            let report = audit(&config)?;
-            let script = actions::generate_script(&report.results, since_days);
+            let report = audit_with_paths(&config, &db)?;
+            let script =
+                actions::generate_script(&report.results, &report.orphan_shims, since_days);
             match output {
                 Some(p) => {
-                    std::fs::write(&p, &script)?;
+                    // write_script_file 带 UTF-8 BOM：PowerShell 5.1 对无 BOM 的
+                    // UTF-8 按 ANSI 解析，脚本里的中文路径会乱码
+                    actions::write_script_file(&p, &script)?;
                     eprintln!(
                         "Wrote cleanup script to {} (review before running)",
                         p.display()
@@ -231,18 +312,17 @@ fn main() -> Result<()> {
                     );
                 }
             }
-            use orphan_audit_core::model::Verdict;
-            for v in [Verdict::Active, Verdict::Unused] {
-                let a: std::collections::BTreeSet<_> =
-                    st.verdict_names(&old, v)?.into_iter().collect();
-                let b: std::collections::BTreeSet<_> =
-                    st.verdict_names(&new, v)?.into_iter().collect();
-                let (added, removed) = diff_names(&a, &b);
-                println!("{}: +{} -{}", v.as_str(), added.len(), removed.len());
-                for x in &added {
+            for diff in st.drift_diff(&old, &new)? {
+                println!(
+                    "{}: +{} -{}",
+                    diff.verdict.as_str(),
+                    diff.added.len(),
+                    diff.removed.len()
+                );
+                for x in &diff.added {
                     println!("  + {x}");
                 }
-                for x in &removed {
+                for x in &diff.removed {
                     println!("  - {x}");
                 }
             }
@@ -253,7 +333,7 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{diff_names, parse_since};
+    use super::parse_since;
 
     #[test]
     fn since_units() {
@@ -267,14 +347,11 @@ mod tests {
     }
 
     #[test]
-    fn diff_names_reports_added_and_removed() {
-        let a: std::collections::BTreeSet<String> =
-            ["keep", "gone"].iter().map(|s| s.to_string()).collect();
-        let b: std::collections::BTreeSet<String> =
-            ["keep", "new"].iter().map(|s| s.to_string()).collect();
-        let (added, removed) = diff_names(&a, &b);
-        assert_eq!(added, vec!["new".to_string()]);
-        assert_eq!(removed, vec!["gone".to_string()]);
+    fn since_overflow_is_error_not_wraparound() {
+        // 溢出必须报错：release 下回绕会把观察窗口静默变成错误的小值
+        assert!(parse_since("99999999y").is_err());
+        assert!(parse_since("4294967295w").is_err()); // ×7 回绕 u32
+        assert!(parse_since("4294967295d").is_ok()); // ×1 不溢出，合法边界
     }
 
     #[test]
